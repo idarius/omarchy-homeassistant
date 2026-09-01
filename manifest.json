@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.idarius.homeassistant",
   "name": "Home Assistant",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "idarius",
   "license": "MIT",
   "description": "Slide-in Home Assistant dashboard from the Omarchy bar: left-click to show or hide it, right-click to configure it.",
@@ -26,7 +26,6 @@
       "margin": 12,
       "autoHide": true,
       "prewarm": true,
-      "sharedProfile": false,
       "animMs": 220,
       "marginX": 12,
       "marginY": 12,
@@ -144,13 +143,6 @@
         "label": "Preload the window at startup",
         "description": "Starts the browser in the background so the first click is instant.",
         "defaultValue": true
-      },
-      {
-        "key": "sharedProfile",
-        "type": "boolean",
-        "label": "Use the browser's own profile",
-        "description": "Reuses your existing session instead of a dedicated profile. Avoids signing in again, but shares cookies and extensions.",
-        "defaultValue": false
       },
       {
         "key": "language",

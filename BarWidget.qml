@@ -39,7 +39,6 @@ BarWidget {
   readonly property int marginY: setting("marginY", root.margin)
   readonly property bool autoHide: setting("autoHide", true)
   readonly property bool prewarm: setting("prewarm", true)
-  readonly property bool sharedProfile: setting("sharedProfile", false)
 
   // Langue de l'interface : auto|en|fr. « auto » suit la locale du systeme
   // (Qt.locale().name, par exemple "fr_FR") et retombe sur l'anglais.
@@ -127,7 +126,6 @@ BarWidget {
             " --position " + quote(position) +
             " --margin-x " + marginX +
             " --margin-y " + marginY
-    if (sharedProfile) a += " --shared-profile"
     if (!autoHide) a += " --no-click-dismiss"
     a += " --anim-ms " + animMs
     return a

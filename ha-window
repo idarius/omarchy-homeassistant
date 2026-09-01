@@ -34,7 +34,6 @@
 #     --margin-y N       vertical margin (top/bottom), on top of the strip
 #                        the bar reserves
 #     --browser BIN      force a specific browser binary
-#     --shared-profile   use the browser's own profile instead of a dedicated one
 #     --anim-ms N        slide duration in ms (default 220, 0 = instant)
 #     --no-click-dismiss do not hide the view when clicking elsewhere
 #
@@ -59,8 +58,10 @@ margin=12
 margin_x=""
 margin_y=""
 browser=""
-shared_profile=0
 click_dismiss=1
+# Le bind souris est GLOBAL : on suit son etat pour pouvoir le retirer meme
+# quand une invocation se termine en erreur (voir `cleanup`).
+click_armed=0
 anim_ms=220
 
 action="${1:-toggle}"
@@ -76,7 +77,6 @@ while (($#)); do
   --margin-x) margin_x="${2:-}"; shift 2 ;;
   --margin-y) margin_y="${2:-}"; shift 2 ;;
   --browser) browser="${2:-}"; shift 2 ;;
-  --shared-profile) shared_profile=1; shift ;;
   --no-click-dismiss) click_dismiss=0; shift ;;
   --anim-ms) anim_ms="${2:-}"; shift 2 ;;
   *) echo "unknown option: $1" >&2; exit 1 ;;
@@ -89,7 +89,147 @@ done
 : "${margin_x:=$margin}"
 : "${margin_y:=$margin}"
 
-mkdir -p "$STATE_DIR"
+# --- validation des entrees --------------------------------------------------
+#
+# Les reglages persistes et la ligne de commande sont des FRONTIERES DE
+# CONFIANCE au meme titre que l'etat sur disque. Le panneau QML borne ce qu'il
+# ecrit, mais rien ne garantit que `~/.config/omarchy/shell.json` n'a pas ete
+# edite a la main, ni que le script n'est pas appele directement. Tout est donc
+# revalide ici, et une valeur hors bornes fait ECHOUER l'invocation au lieu
+# d'etre corrigee en silence : ces valeurs finissent dans des expressions Lua
+# et dans une ligne de commande de navigateur.
+die() { echo "$1" >&2; exit 1; }
+
+# Pas de zero en tete : `((08))` serait lu en octal et sortirait en erreur.
+valid_num() { [[ $1 =~ ^-?(0|[1-9][0-9]{0,6})$ ]]; }
+
+check_int() { # nom valeur min max
+  valid_num "$2" || die "$1 must be an integer (got: '$2')"
+  (( $2 >= $3 && $2 <= $4 )) || die "$1 out of range ($3..$4): $2"
+}
+
+case "$action" in
+toggle | show | hide | prewarm | reposition | status | quit | click | arm-click | disarm-click) ;;
+*) die "unknown action: $action" ;;
+esac
+
+# Schema http(s) UNIQUEMENT : `file:`, `data:` ou `javascript:` ouvriraient
+# tout autre chose que le tableau de bord. Longueur bornee, et jeu de
+# caracteres restreint a ce qu'autorise la RFC 3986 — ni espace, ni guillemet,
+# ni apostrophe, ni retour a la ligne.
+URL_RE='^https?://[A-Za-z0-9._~%!$&()*+,;=:@/?#-]+$'
+if [[ -n $url ]]; then
+  ((${#url} <= 2048)) || die "url is too long (max 2048 characters)"
+  [[ $url =~ $URL_RE ]] || die "url must be an http(s) URL, without quotes or whitespace"
+fi
+
+case "$position" in
+center | top | bottom | left | right | top-left | top-right | bottom-left | bottom-right) ;;
+*) die "unknown position: $position" ;;
+esac
+
+check_int "--width" "$width" 100 10000
+check_int "--height" "$height" 100 10000
+check_int "--margin-x" "$margin_x" 0 4000
+check_int "--margin-y" "$margin_y" 0 4000
+check_int "--anim-ms" "$anim_ms" 0 5000
+
+[[ -z $browser || $browser =~ ^[A-Za-z0-9._/-]{1,255}$ ]] ||
+  die "--browser must be a plain binary name or path"
+
+# `$SELF` finit dans `hl.dsp.exec_cmd(...)`, donc dans une chaine Lua PUIS dans
+# une ligne de commande /bin/sh. On refuse ce qui aurait besoin d'un
+# echappement autre que l'apostrophe simple appliquee au moment de l'usage.
+# Repetition NON BORNEE, avec la longueur testee a part : une borne `{1,4096}`
+# dans une expression rationnelle coute 166 ms a glibc — mesure. C'est le
+# chemin d'affichage, il doit rester instantane.
+[[ ${#SELF} -le 4096 && $SELF =~ ^[A-Za-z0-9\ ._/@+:,=-]+$ ]] ||
+  die "the script path contains unsupported characters: $SELF"
+
+# --- commandes externes bornees ----------------------------------------------
+#
+# Un `hyprctl` qui ne rend jamais la main (compositeur occupe, socket muet)
+# figerait le script — et avec lui le verrou d'invocation ET le bind souris
+# global, qui resterait pose. Chaque appel est donc borne dans le temps.
+# Mesure : `timeout` coute ~1,4 ms, negligeable meme dans la boucle
+# d'animation, qui se cale de toute facon sur l'horloge.
+HYPR_TIMEOUT=5
+hy() { timeout "$HYPR_TIMEOUT" hyprctl "$@"; }
+
+# --- etat sur disque ---------------------------------------------------------
+#
+# L'etat memorise sert a construire des commandes : un lien symbolique ou un
+# fichier non regulier suffirait a rediriger lectures et ecritures vers un
+# chemin arbitraire accessible a l'utilisateur. On exige donc un vrai
+# repertoire, a nous, en 0700 — et des fichiers reguliers, non symboliques.
+# 0700 sur le repertoire, 0600 sur tout ce qu'on y cree — verrou et tube
+# compris, qu'aucun autre code ne passe par `write_state_file`.
+umask 077
+
+init_state_dir() {
+  [[ -L $STATE_DIR ]] && die "state path is a symlink, refusing to use it: $STATE_DIR"
+  if [[ -e $STATE_DIR ]]; then
+    [[ -d $STATE_DIR ]] || die "state path is not a directory: $STATE_DIR"
+  else
+    mkdir -p "$STATE_DIR" || die "cannot create the state directory: $STATE_DIR"
+  fi
+  [[ -O $STATE_DIR ]] || die "state directory is not owned by this user: $STATE_DIR"
+  chmod 700 "$STATE_DIR" || die "cannot set mode 0700 on $STATE_DIR"
+}
+
+# Lecture : fichier REGULIER, non symbolique, a nous — sinon on rend le vide.
+# Le script retombe alors sur le rattrapage par ligne de commande, qui, lui,
+# ne fait confiance a aucun fichier.
+read_state_file() {
+  local f="$1" v
+  [[ -f $f && ! -L $f && -O $f ]] || return 0
+  v=$(< "$f") || return 0
+  printf '%s' "${v%%$'\n'*}"
+}
+
+# Ecriture ATOMIQUE : temporaire dans le meme repertoire, puis `mv`. Le
+# `rename(2)` REMPLACE la cible quelle qu'elle soit — un lien symbolique
+# depose entre-temps est ecrase, pas suivi. Une redirection `>` l'aurait suivi
+# et aurait tronque le fichier vise.
+write_state_file() {
+  local f="$1" v="$2" tmp
+  tmp=$(mktemp "$STATE_DIR/.tmp.XXXXXX") || return 1
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  printf '%s' "$v" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+}
+
+init_state_dir
+
+# --- valeurs venues du compositeur ou d'un fichier ---------------------------
+#
+# Motifs BORNES, verifies avant tout usage. Ce qui ne correspond pas est
+# ECARTE, pas echappe : a cet endroit, une valeur inattendue signale un etat
+# corrompu, pas un cas a rattraper.
+valid_addr() { [[ $1 =~ ^0x[0-9a-fA-F]{1,16}$ ]]; }
+# Classe fabriquee par Chromium a partir de l'URL, p. ex.
+# « chrome-ha.example.net__dashboard_accueil-Default ».
+valid_class() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
+valid_mon() { [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
+
+# Deuxieme rempart : ce qui entre malgre tout dans une chaine Lua y est
+# echappe. Le premier rempart reste l'allowlist ci-dessus — cette fonction ne
+# sert pas a rendre acceptable une valeur qui ne l'est pas.
+lua_str() {
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  printf '"%s"' "$s"
+}
+
+# Apostrophes simples pour /bin/sh, a l'interieur de la chaine Lua.
+sh_word() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# Constantes du bind souris, echappees UNE FOIS : `$( ... )` coute un fork, et
+# `arm_click` est sur le chemin d'affichage.
+LUA_CLICK_BUTTON=$(lua_str "$CLICK_BUTTON")
+LUA_CLICK_CMD=$(lua_str "$(sh_word "$SELF") click")
 
 # --- une invocation a la fois ------------------------------------------------
 #
@@ -100,7 +240,14 @@ mkdir -p "$STATE_DIR"
 #
 # Attente courte : passe ce delai, c'est qu'une autre invocation fait deja le
 # travail. Toutes les actions sont idempotentes, abandonner est correct.
-exec 9>"$STATE_DIR/lock"
+#
+# `exec 9>` SUIT un lien symbolique. Le repertoire est verifie plus haut, mais
+# un fichier `lock` deja detourne y survivrait : on le remet a plat.
+LOCK_FILE="$STATE_DIR/lock"
+if [[ -L $LOCK_FILE || (-e $LOCK_FILE && ! -f $LOCK_FILE) ]]; then
+  rm -f "$LOCK_FILE" || die "cannot reset the lock file: $LOCK_FILE"
+fi
+exec 9>"$LOCK_FILE"
 flock -w 3 9 || exit 0
 
 # --- navigateur -------------------------------------------------------------
@@ -113,14 +260,18 @@ resolve_browser() {
   fi
 
   local desktop exec_bin
-  desktop=$(env -u BROWSER xdg-settings get default-web-browser 2>/dev/null || true)
-  [[ -z $desktop ]] && desktop=$(xdg-mime query default x-scheme-handler/https 2>/dev/null || true)
+  # Bornees : `xdg-settings` interroge le bureau et peut rester suspendu si le
+  # portail ne repond pas, ce qui figerait le verrou d'invocation.
+  desktop=$(timeout 5 env -u BROWSER xdg-settings get default-web-browser 2>/dev/null || true)
+  [[ -z $desktop ]] && desktop=$(timeout 5 xdg-mime query default x-scheme-handler/https 2>/dev/null || true)
+  # Un nom de fichier .desktop, pas un chemin : ni « / », ni « .. ».
+  [[ $desktop =~ ^[A-Za-z0-9._+-]{1,255}\.desktop$ ]] || desktop=""
 
   if [[ -n $desktop ]]; then
     exec_bin=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' \
       {"$HOME"/.local,"$HOME"/.nix-profile,/usr}/share/applications/"$desktop" 2>/dev/null | head -1)
     if [[ -n $exec_bin ]] && command -v "$exec_bin" >/dev/null 2>&1 &&
-       "$exec_bin" --help 2>/dev/null | grep -q -- "--app"; then
+       timeout 5 "$exec_bin" --help 2>/dev/null | grep -q -- "--app"; then
       command -v "$exec_bin"; return 0
     fi
   fi
@@ -134,7 +285,12 @@ resolve_browser() {
   return 1
 }
 
-stored_class() { [[ -f $CLASS_FILE ]] && cat "$CLASS_FILE" || true; }
+# Une classe ou une adresse memorisee qui ne correspond pas a son motif est
+# ECARTEE. Le script repart alors sur le rattrapage par ligne de commande.
+stored_class() {
+  local v; v=$(read_state_file "$CLASS_FILE")
+  if [[ -n $v ]] && valid_class "$v"; then printf '%s' "$v"; fi
+}
 
 # La fenetre appartient-elle a notre profil dedie ?
 # `$(< fichier)` est une redirection interne a bash : aucun processus lance,
@@ -143,13 +299,18 @@ stored_class() { [[ -f $CLASS_FILE ]] && cat "$CLASS_FILE" || true; }
 # sous-chaine.
 owns_window() {
   local pid="$1" cmd
-  [[ -n $pid && $pid != 0 && -r /proc/$pid/cmdline ]] || return 1
+  # Le PID compose un chemin sous /proc : il doit etre un nombre, sinon un
+  # « .. » en ferait une lecture ailleurs.
+  [[ $pid =~ ^[1-9][0-9]{0,9}$ && -r /proc/$pid/cmdline ]] || return 1
   # Les avertissements « octet nul ignore » de bash sont attendus et sans
   # consequence ici : on les tait plutot que de lancer un `tr`.
   { cmd=$(< "/proc/$pid/cmdline"); } 2>/dev/null || return 1
   [[ $cmd == *"--user-data-dir=$PROFILE_DIR"* ]]
 }
-stored_addr()  { [[ -f $ADDR_FILE  ]] && cat "$ADDR_FILE"  || true; }
+stored_addr() {
+  local v; v=$(read_state_file "$ADDR_FILE")
+  if [[ -n $v ]] && valid_addr "$v"; then printf '%s' "$v"; fi
+}
 
 # --- lecture d'etat ---------------------------------------------------------
 #
@@ -247,7 +408,7 @@ mon_y=""; off_x=""
 
 read_state() {
   local ref="${1:-window}" line
-  line=$(hyprctl -j --batch 'clients;monitors' | jq -s -r \
+  line=$(hy -j --batch 'clients;monitors' | jq -s -r \
     --arg addr "$(stored_addr)" --arg cls "$(stored_class)" \
     --arg special "$SPECIAL" --arg pos "$position" --arg ref "$ref" \
     --argjson w "$width" --argjson h "$height" \
@@ -259,6 +420,22 @@ read_state() {
   IFS=$'\x1f' read -r addr float cur_w cur_h cur_x cur_y tgt_x tgt_y \
     pid in_special special_mon focused_ws mon_y off_x <<<"$line"
 
+  # RIEN DE CE QUI SUIT NE DEVIENT DE LA SYNTAXE LUA SANS AVOIR ETE VERIFIE.
+  # Ces valeurs viennent de jq, donc du compositeur, mais elles ont transite
+  # par des fichiers d'etat et une ligne de commande : on les revalide au
+  # point d'entree plutot qu'a chaque usage.
+  local n
+  for n in cur_w cur_h cur_x cur_y tgt_x tgt_y focused_ws mon_y off_x pid; do
+    valid_num "${!n}" || die "unexpected compositor state for $n: '${!n}'"
+  done
+  for n in float in_special; do
+    [[ ${!n} == true || ${!n} == false ]] ||
+      die "unexpected compositor state for $n: '${!n}'"
+  done
+  [[ -z $special_mon ]] || valid_mon "$special_mon" ||
+    die "unexpected monitor name: '$special_mon'"
+  [[ -z $addr ]] || valid_addr "$addr" || addr=""
+
   # PREUVE DE PROPRIETE. La classe ne suffit pas a prouver que la fenetre est
   # la notre : Chromium la fabrique a partir de l'URL, donc une fenetre que
   # l'utilisateur aurait lui-meme ouverte sur le meme tableau de bord (chromium
@@ -267,9 +444,12 @@ read_state() {
   # controle.
   #
   # On exige donc que le processus de la fenetre utilise NOTRE profil dedie.
-  # Avec un profil partage, cette preuve n'existe pas : on s'en tient a l'etat
-  # memorise, qui n'est ecrit que par nos propres lancements.
-  if [[ -n $addr ]] && ((!shared_profile)) && ! owns_window "$pid"; then
+  # Cette preuve est INCONDITIONNELLE. Une option « profil partage » l'aurait
+  # rendue impossible — toutes les fenetres d'un profil Chromium partagent un
+  # seul processus, donc une seule ligne de commande — et il n'existe aucun
+  # marqueur de propriete par fenetre pour la remplacer. L'option a donc ete
+  # retiree plutot que documentee comme un contournement.
+  if [[ -n $addr ]] && ! owns_window "$pid"; then
     addr=""; vis="absente"
   fi
 
@@ -285,11 +465,14 @@ read_state() {
   if [[ $vis == absente && ${2:-} != "recovered" ]]; then
     local found
     if found=$(recover_window); then
-      printf '%s' "$found" > "$ADDR_FILE"
-      # printf, pas une redirection de jq : `stored_class` lit avec cat, un
-      # saut de ligne final ferait echouer toutes les comparaisons de classe.
-      printf '%s' "$(hyprctl clients -j | jq -r --arg a "$found" \
-        'map(select(.address == $a)) | first | .class // ""')" > "$CLASS_FILE"
+      local found_cls
+      found_cls=$(hy clients -j | jq -r --arg a "$found" \
+        'map(select(.address == $a)) | first | .class // ""')
+      # Remplacement atomique, jamais une redirection : `>` suivrait un lien
+      # symbolique depose a la place du fichier d'etat. Et pas de saut de
+      # ligne final, qui ferait echouer toutes les comparaisons de classe.
+      write_state_file "$ADDR_FILE" "$found" || true
+      write_state_file "$CLASS_FILE" "$found_cls" || true
       read_state "$ref" recovered
       return 0
     fi
@@ -297,7 +480,7 @@ read_state() {
 
   # L'adresse retrouvee par la classe peut differer de celle memorisee : on la
   # reecrit, c'est elle que le widget de barre lit pour connaitre l'etat reel.
-  [[ -n $addr && $addr != "$(stored_addr)" ]] && printf '%s' "$addr" > "$ADDR_FILE"
+  [[ -n $addr && $addr != "$(stored_addr)" ]] && write_state_file "$ADDR_FILE" "$addr"
   return 0
 }
 
@@ -324,15 +507,20 @@ arm_click() {
   # deux binds, et un seul clic lancait alors deux `ha-window click`.
   # Verifie avec `hyprctl binds -j` (le compte montait a 2, 3, ...).
   disarm_click
-  hyprctl eval \
-    "hl.bind(\"$CLICK_BUTTON\", hl.dsp.exec_cmd(\"$SELF click\"), { non_consuming = true })" \
+  # `$SELF` est verifie au demarrage (jeu de caracteres borne), puis mis entre
+  # apostrophes pour /bin/sh et echappe pour Lua : le chemin d'installation ne
+  # peut pas devenir de la syntaxe, dans aucune des deux couches.
+  hy eval \
+    "hl.bind($LUA_CLICK_BUTTON, hl.dsp.exec_cmd($LUA_CLICK_CMD), { non_consuming = true })" \
     >/dev/null 2>&1
+  click_armed=1
 }
 
 # `hl.unbind` ne retire que le bind SANS modificateur : le « Move window »
 # d'Omarchy (SUPER + mouse:272, modmask 64) est preserve. Verifie.
 disarm_click() {
-  hyprctl eval "hl.unbind(\"$CLICK_BUTTON\")" >/dev/null 2>&1
+  hy eval "hl.unbind($LUA_CLICK_BUTTON)" >/dev/null 2>&1
+  click_armed=0
 }
 
 click_outside() {
@@ -348,9 +536,12 @@ click_outside() {
   if [[ -n ${HA_CLICK_AT:-} ]]; then
     read -r cx cy <<<"$HA_CLICK_AT"
   else
-    read -r cx cy < <(hyprctl cursorpos -j | jq -r '"\(.x) \(.y)"')
+    read -r cx cy < <(hy cursorpos -j | jq -r '"\(.x) \(.y)"')
   fi
-  [[ -n ${cy:-} ]] || return 0
+  # La position du pointeur alimente une comparaison arithmetique et deux
+  # `--argjson` : elle est verifiee, y compris quand elle vient du crochet de
+  # test HA_CLICK_AT.
+  valid_num "${cx:-}" && valid_num "${cy:-}" || return 0
 
   # Clic DANS la vue : ne rien faire.
   (( cx >= cur_x && cx < cur_x + cur_w && cy >= cur_y && cy < cur_y + cur_h )) && return 0
@@ -359,7 +550,7 @@ click_outside() {
   # l'affaire du widget, pas la notre. Sans ca, cliquer sur l'icone declenchait
   # a la fois ce masquage et le `toggle` du widget, qui rouvrait aussitot.
   local in_bar
-  in_bar=$(hyprctl monitors -j | jq -r --argjson x "$cx" --argjson y "$cy" '
+  in_bar=$(hy monitors -j | jq -r --argjson x "$cx" --argjson y "$cy" '
     map(select($x >= .x and $x < .x + .width and $y >= .y and $y < .y + .height))
     | first
     | if . == null then "non"
@@ -387,13 +578,6 @@ click_outside() {
 recover_window() {
   [[ -n $url ]] || return 1
 
-  # JAMAIS avec un profil partage. Toutes les fenetres d'un profil Chromium
-  # partagent un seul processus : si c'est notre lancement qui l'a demarre, sa
-  # ligne de commande porte `--app=<url>` et TOUTES les fenetres de
-  # l'utilisateur correspondraient — le rattrapage adopterait une fenetre a lui,
-  # et les dispatchers geometriques la deplaceraient. Avec un profil partage on
-  # s'en tient donc a l'etat memorise.
-  ((shared_profile)) && return 1
   # Meme preuve de propriete que l'identification normale : le processus doit
   # utiliser notre profil dedie. C'est plus sur que de comparer l'URL, et c'est
   # le seul critere qui distingue notre fenetre d'une fenetre que l'utilisateur
@@ -403,8 +587,9 @@ recover_window() {
   # contiennent jamais.
   local a p
   while IFS=: read -r a p; do
+    valid_addr "$a" || continue
     if owns_window "$p"; then printf '%s' "$a"; return 0; fi
-  done < <(hyprctl clients -j | jq -r '
+  done < <(hy clients -j | jq -r '
     .[] | select(.class // "" | startswith("chrome")) | "\(.address):\(.pid)"')
   return 1
 }
@@ -420,18 +605,19 @@ close_special() {
   # anterieure : `toggle_special` est une bascule, et refermer sur un etat
   # perime ROUVRE la reserve au lieu de la fermer.
   local mon
-  mon=$(hyprctl monitors -j | jq -r --arg n "special:$SPECIAL" \
+  mon=$(hy monitors -j | jq -r --arg n "special:$SPECIAL" \
     'map(select(.specialWorkspace.name == $n)) | first | .name // ""')
   [[ -n $mon ]] || return 0
+  valid_mon "$mon" || { echo "unexpected monitor name: '$mon'" >&2; return 1; }
 
   # La bascule agit sur l'ecran FOCALISE : l'appeler alors que la reserve est
   # ouverte sur un AUTRE ecran l'ouvrirait la ou on se trouve.
-  hyprctl --batch \
-    "dispatch hl.dsp.focus({ monitor = \"$mon\" }) ; dispatch hl.dsp.workspace.toggle_special(\"$SPECIAL\")" \
+  hy --batch \
+    "dispatch hl.dsp.focus({ monitor = $(lua_str "$mon") }) ; dispatch hl.dsp.workspace.toggle_special($(lua_str "$SPECIAL"))" \
     >/dev/null 2>&1
 
   local still
-  still=$(hyprctl monitors -j | jq -r --arg n "special:$SPECIAL" \
+  still=$(hy monitors -j | jq -r --arg n "special:$SPECIAL" \
     '[.[] | select(.specialWorkspace.name == $n)] | length')
   [[ $still == 0 ]] || { echo "the reserve stayed open on a monitor" >&2; return 1; }
 }
@@ -451,11 +637,11 @@ close_special() {
 # INVARIANTE A CONSERVER : aucun dispatcher sans cible confirmee.
 focus_window() {
   local target="$1" active
-  [[ -n $target ]] || return 1
+  valid_addr "$target" || { echo "refusing to focus an invalid address: '$target'" >&2; return 1; }
 
-  hyprctl dispatch "hl.dsp.focus({ window = \"address:$target\" })" >/dev/null 2>&1
+  hy dispatch "hl.dsp.focus({ window = $(lua_str "address:$target") })" >/dev/null 2>&1
 
-  active=$(hyprctl activewindow -j | jq -r '.address // ""')
+  active=$(hy activewindow -j | jq -r '.address // ""')
   [[ $active == "$target" ]] || {
     echo "focus not acquired (target $target, active ${active:-none})" >&2
     return 1
@@ -520,14 +706,28 @@ snooze() {
 # Un `hyprctl reload` la perd sans changer la signature d'instance ; le
 # prochain lancement du navigateur (prechauffage au demarrage du shell) la
 # repose.
+#
+# LA CLASSE NE DEVIENT PAS DE LA SYNTAXE. Elle vient du compositeur puis d'un
+# fichier d'etat, et elle etait auparavant interpolee telle quelle dans
+# l'expression Lua. Elle passe maintenant par `stored_class`, qui n'en rend
+# une que si elle correspond a l'allowlist `valid_class`, puis par `lua_str`,
+# qui echappe ce qui pourrait encore fermer la chaine.
+#
+# Le nom du marqueur inclut la signature d'instance Hyprland, qui vient de
+# l'environnement : il est verifie lui aussi, sinon un `..` en ferait un
+# chemin d'ecriture arbitraire.
 ensure_no_anim() {
   local cls; cls=$(stored_class)
   [[ -n $cls ]] || return 0
-  local mark="$STATE_DIR/noanim.${HYPRLAND_INSTANCE_SIGNATURE:-inconnue}"
-  [[ -f $mark ]] && return 0
-  hyprctl eval "hl.window_rule({ match = { class = \"$cls\" }, no_anim = true })" \
+
+  local sig="${HYPRLAND_INSTANCE_SIGNATURE:-unknown}"
+  [[ $sig =~ ^[A-Za-z0-9_-]{1,128}$ ]] || sig="unknown"
+  local mark="$STATE_DIR/noanim.$sig"
+  [[ -f $mark && ! -L $mark ]] && return 0
+
+  hy eval "hl.window_rule({ match = { class = $(lua_str "$cls") }, no_anim = true })" \
     >/dev/null 2>&1
-  : > "$mark"
+  write_state_file "$mark" "" || true
 }
 
 # Horloge en millisecondes SANS processus : `EPOCHREALTIME` est une variable
@@ -564,8 +764,13 @@ FRAME_MS=7
 slide() {
   local from="$1" to="$2" y="$3"
   ((anim_ms > 0)) || return 0
-  [[ -n $addr ]] || return 0
+  valid_addr "$addr" || return 0
+  valid_num "$from" && valid_num "$to" && valid_num "$y" || return 0
   [[ -n $SLEEP_FD ]] || open_snooze || true
+
+  # La cible est echappee UNE FOIS, hors de la boucle : `$( ... )` coute un
+  # fork, et la boucle vise ~144 images/s.
+  local tgt; tgt="{ window = $(lua_str "address:$addr")"
 
   local start el t e x spent rest st
   start=$(now_ms)
@@ -576,8 +781,7 @@ slide() {
     t=$((el * 1000 / anim_ms))
     e=$((1000 - (1000 - t) * (1000 - t) * (1000 - t) / 1000000))
     x=$((from + (to - from) * e / 1000))
-    hyprctl dispatch "hl.dsp.window.move({ window = \"address:$addr\", x = $x, y = $y })" \
-      >/dev/null 2>&1
+    hy dispatch "hl.dsp.window.move($tgt, x = $x, y = $y })" >/dev/null 2>&1
     # Dormir le RESTE de l'image, pas une duree fixe.
     spent=$(( $(now_ms) - start - el ))
     rest=$(( FRAME_MS - spent ))
@@ -585,8 +789,7 @@ slide() {
   done
 
   # Image finale exacte : la boucle s'arrete sur le temps, pas sur la position.
-  hyprctl dispatch "hl.dsp.window.move({ window = \"address:$addr\", x = $to, y = $y })" \
-    >/dev/null 2>&1
+  hy dispatch "hl.dsp.window.move($tgt, x = $to, y = $y })" >/dev/null 2>&1
 }
 
 # Construit la sequence de dispatchers geometriques, en n'incluant que ce qui
@@ -601,7 +804,8 @@ slide() {
 # fenetre de l'utilisateur. Verifie — une autre fenetre focalisee n'est pas
 # touchee, et le focus n'est pas vole.
 geometry_cmds() {
-  local cmds="" tgt="{ window = \"address:$addr\""
+  valid_addr "$addr" || { echo "refusing to move an invalid address: '$addr'" >&2; return 1; }
+  local cmds="" tgt="{ window = $(lua_str "address:$addr")"
   [[ $float != true ]] && cmds+="dispatch hl.dsp.window.float($tgt }) ; "
   [[ $cur_w != "$width" || $cur_h != "$height" ]] &&
     cmds+="dispatch hl.dsp.window.resize($tgt, x = $width, y = $height }) ; "
@@ -620,7 +824,7 @@ reposition() {
   # SANS focus, volontairement : `reposition` est appele en direct pendant que
   # le panneau de reglages est ouvert (apercu des tailles). Focaliser la vue
   # volerait le focus au panneau, dont le HyprlandFocusGrab le refermerait.
-  hyprctl --batch "$cmds" >/dev/null 2>&1
+  hy --batch "$cmds" >/dev/null 2>&1
 }
 
 launch() {
@@ -628,11 +832,14 @@ launch() {
   bin=$(resolve_browser) || exit 1
   [[ -n $url ]] || { echo "no URL configured" >&2; exit 1; }
 
-  before=$(hyprctl clients -j | jq -r '[.[].address] | join(" ")')
+  before=$(hy clients -j | jq -r '[.[].address] | join(" ")')
 
   args=(--app="$url" --no-first-run --no-default-browser-check
         --disable-session-crashed-bubble --hide-crash-restore-bubble --noerrdialogs)
-  ((shared_profile)) || args+=(--user-data-dir="$PROFILE_DIR")
+  # Profil DEDIE, toujours : c'est lui qui rend la preuve de propriete
+  # possible (`owns_window`). Sans profil dedie, aucune fenetre ne serait
+  # distinguable de celles de l'utilisateur.
+  args+=(--user-data-dir="$PROFILE_DIR")
   # `9>&-` ferme le descripteur du verrou AVANT exec : sans cela le
   # navigateur HERITE du fd 9 et garde le flock pour toute sa duree de vie.
   # Toutes les invocations suivantes (toggle, hide, click) expiraient alors
@@ -644,7 +851,7 @@ launch() {
   # froid du profil, initialisation GPU. 60 s de patience, sinon un premier
   # lancement lent passerait pour un echec.
   for _ in $(seq 1 240); do
-    new_addr=$(hyprctl clients -j | jq -r --arg before "$before" '
+    new_addr=$(hy clients -j | jq -r --arg before "$before" '
       ($before | split(" ")) as $seen
       | map(select((.address as $a | $seen | index($a) | not)
                    and (.class // "" | startswith("chrome"))))
@@ -659,17 +866,22 @@ launch() {
     return 1
   }
 
-  cls=$(hyprctl clients -j | jq -r --arg a "$new_addr" '
+  cls=$(hy clients -j | jq -r --arg a "$new_addr" '
     map(select(.address == $a)) | first | .class // ""')
-  printf '%s' "$cls" > "$CLASS_FILE"
-  printf '%s' "$new_addr" > "$ADDR_FILE"
+  valid_class "$cls" || { echo "the window class is not usable: '$cls'" >&2; return 1; }
+  write_state_file "$CLASS_FILE" "$cls" || return 1
+  write_state_file "$ADDR_FILE" "$new_addr" || return 1
   rm -f "$STATE_DIR"/noanim.* 2>/dev/null || true
   ensure_no_anim
 
   # Geometrie posee ici une fois pour toutes, puis la fenetre part en reserve.
   reposition || true
   focus_window "$new_addr" || return 1
-  hyprctl dispatch "hl.dsp.window.move({ workspace = \"special:$SPECIAL\" })" >/dev/null 2>&1
+  # Cible NOMMEE, comme partout ailleurs : le garde-fou « focaliser puis agir
+  # sur la fenetre active » reste, mais il n'est plus le seul rempart.
+  hy dispatch \
+    "hl.dsp.window.move({ window = $(lua_str "address:$new_addr"), workspace = $(lua_str "special:$SPECIAL") })" \
+    >/dev/null 2>&1
   close_special || true
 }
 
@@ -699,14 +911,15 @@ show() {
   local start_x="$tgt_x"
   ((anim_ms > 0)) && { ensure_no_anim; start_x="$off_x"; }
 
-  local tgt="{ window = \"address:$addr\""
-  local cmds="dispatch hl.dsp.window.move($tgt, workspace = \"$focused_ws\" })"
+  valid_addr "$addr" || { echo "show cancelled: invalid window address" >&2; return 1; }
+  local tgt="{ window = $(lua_str "address:$addr")"
+  local cmds="dispatch hl.dsp.window.move($tgt, workspace = $(lua_str "$focused_ws") })"
   [[ $float != true ]] && cmds+=" ; dispatch hl.dsp.window.float($tgt })"
   [[ $cur_w != "$width" || $cur_h != "$height" ]] &&
     cmds+=" ; dispatch hl.dsp.window.resize($tgt, x = $width, y = $height })"
   cmds+=" ; dispatch hl.dsp.window.move($tgt, x = $start_x, y = $tgt_y })"
   cmds+=" ; dispatch hl.dsp.focus($tgt })"
-  hyprctl --batch "$cmds" >/dev/null 2>&1
+  hy --batch "$cmds" >/dev/null 2>&1
 
   slide "$start_x" "$tgt_x" "$tgt_y"
 
@@ -726,6 +939,8 @@ hide() {
   # Deja dans la reserve, mais la reserve est ouverte : rien a deplacer, il
   # suffit de la refermer.
   if [[ $in_special == true ]]; then disarm_click; close_special; return $?; fi
+
+  valid_addr "$addr" || { echo "hide cancelled: invalid window address" >&2; return 1; }
 
   disarm_click
 
@@ -747,14 +962,39 @@ hide() {
   # la reserve certaine, donc le `toggle_special` qui suit deterministe. Sans
   # focus, le mouvement n'ouvrirait pas la reserve et la bascule l'ouvrirait —
   # exactement le piege deja connu.
-  hyprctl --batch \
-    "dispatch hl.dsp.focus({ window = \"address:$addr\" }) ; dispatch hl.dsp.window.move({ window = \"address:$addr\", workspace = \"special:$SPECIAL\" }) ; dispatch hl.dsp.workspace.toggle_special(\"$SPECIAL\")" \
+  local tgt="{ window = $(lua_str "address:$addr")"
+  hy --batch \
+    "dispatch hl.dsp.focus($tgt }) ; dispatch hl.dsp.window.move($tgt, workspace = $(lua_str "special:$SPECIAL") }) ; dispatch hl.dsp.workspace.toggle_special($(lua_str "$SPECIAL"))" \
     >/dev/null 2>&1
 
   # Filet idempotent : relit l'etat et ne ferme que si la reserve est restee
   # ouverte.
   close_special
 }
+
+# --- filet de nettoyage ------------------------------------------------------
+#
+# Le bind souris est GLOBAL : une fois pose, il lance `ha-window click` a
+# CHAQUE clic du bureau. Une sortie en erreur au milieu de `show` — compositeur
+# qui ne repond plus, navigateur qui ne mappe jamais sa fenetre, hyprctl coupe
+# par son `timeout` — le laissait en place sans que rien ne le retire, et le
+# bureau restait avec un bind orphelin jusqu'au prochain `omarchy restart shell`.
+#
+# Le filet ne coute un `hyprctl eval` que sur le chemin d'erreur, et seulement
+# si la fenetre n'est pas visible : un `hide` qui echoue apres coup ne doit pas
+# desarmer un bind encore legitime.
+cleanup() {
+  local rc=$?
+  set +e
+  if ((rc != 0)) && ((click_dismiss)); then
+    if ((click_armed)) || [[ $vis != visible ]]; then
+      hy eval "hl.unbind($LUA_CLICK_BUTTON)" >/dev/null 2>&1
+    fi
+  fi
+  [[ -n $SLEEP_FD ]] && exec {SLEEP_FD}>&-
+  return 0
+}
+trap cleanup EXIT
 
 case "$action" in
 # Prechauffage : lance la fenetre et la laisse CACHEE dans le special
@@ -783,7 +1023,8 @@ toggle)
 reposition) reposition ;;
 quit)
   read_state window
-  [[ -n $addr ]] && hyprctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" >/dev/null 2>&1
+  [[ -n $addr ]] && valid_addr "$addr" &&
+    hy dispatch "hl.dsp.window.close({ window = $(lua_str "address:$addr") })" >/dev/null 2>&1
   disarm_click
   rm -f "$CLASS_FILE" "$ADDR_FILE" "$STATE_DIR"/noanim.*
   ;;
@@ -800,7 +1041,7 @@ status)
   echo "target    : ${tgt_x},${tgt_y}"
   echo "url       : ${url:-<not configured>}"
   echo "browser   : $(resolve_browser 2>/dev/null || echo "not found")"
-  echo "profile   : $( ((shared_profile)) && echo shared || echo "$PROFILE_DIR")"
+  echo "profile   : $PROFILE_DIR"
   ;;
 *) echo "unknown action: $action" >&2; exit 1 ;;
 esac

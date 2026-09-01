@@ -14,6 +14,20 @@ system locale.
 
 ![The dashboard window docked to the top right of the screen](preview.jpg)
 
+## Requirements
+
+Native, non-bundled dependencies, all part of a stock Omarchy 4 install:
+
+| | Why |
+|---|---|
+| `chromium` | The dashboard window is a real browser window in `--app` mode. Any Chromium-family browser works; Firefox cannot open a chromeless window. |
+| `jq` | Reads the compositor's JSON state. |
+| `hyprctl` | Hyprland's control socket; the plugin is Hyprland-only. |
+| `bash` 4.4+ | `ha-window` is a Bash script. |
+
+Nothing is downloaded, and no service is installed. If any of these is missing,
+`ha-window` reports it and does nothing.
+
 ## Install
 
 ```sh
@@ -26,8 +40,8 @@ Then right-click the icon and fill in your dashboard URL, for example
 The window uses a **dedicated browser profile**
 (`~/.local/share/omarchy-homeassistant`), so the first time you open it you will
 have to sign in to Home Assistant once. The session is kept in that profile
-afterwards. Turn on *Use the browser's own profile* if you would rather reuse
-your normal Chromium session. See the caveat under Settings.
+afterwards. That profile is not a convenience: it is what lets the plugin prove
+a window is its own before moving it. See *How it works*.
 
 ## Remove
 
@@ -59,7 +73,6 @@ If the dashboard window happens to be running, close it first with
 | Open duration | Slide duration in milliseconds. `0` makes the window appear instantly. |
 | Hide when clicking elsewhere | Off keeps the window up until you click the icon again. |
 | Preload the window at startup | Starts the browser hidden so the first click is instant. Costs memory and a little CPU while idle; see Resource use. |
-| Use the browser's own profile | Reuses your existing Chromium session instead of a dedicated profile. Convenient, but it also **disables the ownership check** below. |
 | Language | Automatic, English or French. |
 
 ## How it works
@@ -80,8 +93,25 @@ moving or resizing anything: the window's process must be running with the
 plugin's own `--user-data-dir`. This matters because Chromium derives its window
 class from the URL, so a window you opened yourself on the same dashboard would
 otherwise be indistinguishable, and would get moved and resized out from under
-you. With *Use the browser's own profile* that proof cannot exist, and the
-plugin falls back to its stored state alone.
+you.
+
+That proof is unconditional. Earlier versions offered a *use the browser's own
+profile* setting; it has been **removed**, because all windows of one Chromium
+profile share a single process, so in that mode no per-window ownership marker
+can exist and the check had to be skipped. A documented bypass of the one safety
+property that matters is not worth a saved login.
+
+Every value that ends up in a Hyprland `eval` expression — window address,
+window class, monitor name, workspace, coordinates — is matched against a
+strict, bounded pattern first, and escaped on top of that; anything that does
+not match is discarded rather than used. Settings are re-validated inside
+`ha-window` itself (scheme and length for the URL, enumerated position, bounded
+integers), because `shell.json` can be edited by hand and the script can be
+called directly. State lives in a directory the script requires to be a real
+directory, owned by you, mode `0700`; state files are read only when they are
+regular files and written by atomic replacement, so a symlink dropped in their
+place is overwritten rather than followed. Every `hyprctl` call is
+time-bounded, and the global mouse binding is removed on any failed exit.
 
 ## Resource use
 
@@ -152,8 +182,7 @@ window*) is left alone.
 
 ## Dependencies
 
-Nothing beyond Omarchy 4 itself: `chromium`, `jq` and `hyprctl` are all part of
-a stock install. The plugin writes only its own entry in
+Nothing beyond Omarchy 4 itself; see *Requirements* above. The plugin writes only its own entry in
 `~/.config/omarchy/shell.json`, a little state in
 `~/.local/state/omarchy/homeassistant/`, and the browser profile in
 `~/.local/share/omarchy-homeassistant/`. It makes no network request of its

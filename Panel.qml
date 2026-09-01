@@ -165,22 +165,6 @@ Panel {
         }
       }
 
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(8)
-        Text {
-          Layout.fillWidth: true
-          text: root.tr("sharedProfile")
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-        }
-        ToggleSwitch {
-          checked: root.get("sharedProfile", false)
-          onToggled: root.save("sharedProfile", !checked)
-        }
-      }
-
       Dropdown {
         Layout.fillWidth: true
         label: root.tr("language")
