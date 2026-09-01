@@ -1,0 +1,806 @@
+#!/usr/bin/env bash
+# Fenetre Home Assistant escamotable, pilotee par le widget de barre.
+#
+# Pourquoi pas une vraie webview : QtWebEngine embarque Chromium, qui exige
+# QtWebEngineQuick::initialize() avant la creation de l'application. Quickshell
+# ne le fait pas, le processus meurt sur « base::CommandLine cannot be properly
+# initialized » et emporte la barre avec lui. Verifie, reproductible.
+#
+# On utilise donc une fenetre de navigateur en mode application, placee dans un
+# special workspace Hyprland : l'apparition est animee par le compositeur.
+#
+# Identification de la fenetre : par ADRESSE, relevee par difference avant/apres
+# lancement et memorisee. PAS par classe : sous Wayland, Chromium ignore --class
+# et fabrique la sienne a partir de l'URL (« chrome-homeassistant.local__-Default »),
+# elle change donc des que l'utilisateur change de tableau de bord.
+# La classe reste memorisee, mais comme RATTRAPAGE et surtout comme CONTROLE DE
+# SURETE de l'adresse (voir window_address).
+#
+# Geometrie : appliquee par dispatchers apres apparition, PAS par regles de
+# fenetre, pour la meme raison.
+#
+# Outils : bash, hyprctl et jq. jq est dans omarchy-base.packages, au meme titre
+# que chromium — donc present sur toute installation Omarchy.
+#
+# Usage:
+#   ha-window toggle|show|hide|prewarm|reposition|status|quit [options]
+#     --url URL          dashboard page to open
+#     --width N          width in pixels (default 480)
+#     --height N         height in pixels (default 800)
+#     --position POS     center|top|bottom|left|right
+#                        |top-left|top-right|bottom-left|bottom-right
+#     --margin N         common margin, used as the default for both below
+#     --margin-x N       side margin (left/right edge)
+#     --margin-y N       vertical margin (top/bottom), on top of the strip
+#                        the bar reserves
+#     --browser BIN      force a specific browser binary
+#     --shared-profile   use the browser's own profile instead of a dedicated one
+#     --anim-ms N        slide duration in ms (default 220, 0 = instant)
+#     --no-click-dismiss do not hide the view when clicking elsewhere
+#
+# Test hook: HA_CLICK_AT="X Y" overrides the pointer position for `click`.
+
+set -euo pipefail
+
+SELF=$(realpath "$0")
+SPECIAL="homeassistant"
+# Bouton gauche. Le bind est pose UNIQUEMENT pendant que la vue est affichee.
+CLICK_BUTTON="mouse:272"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/homeassistant"
+CLASS_FILE="$STATE_DIR/window-class"
+ADDR_FILE="$STATE_DIR/window-address"
+PROFILE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-homeassistant"
+
+url=""
+width=480
+height=800
+position="top-right"
+margin=12
+margin_x=""
+margin_y=""
+browser=""
+shared_profile=0
+click_dismiss=1
+anim_ms=220
+
+action="${1:-toggle}"
+shift || true
+
+while (($#)); do
+  case "$1" in
+  --url) url="${2:-}"; shift 2 ;;
+  --width) width="${2:-}"; shift 2 ;;
+  --height) height="${2:-}"; shift 2 ;;
+  --position) position="${2:-}"; shift 2 ;;
+  --margin) margin="${2:-}"; shift 2 ;;
+  --margin-x) margin_x="${2:-}"; shift 2 ;;
+  --margin-y) margin_y="${2:-}"; shift 2 ;;
+  --browser) browser="${2:-}"; shift 2 ;;
+  --shared-profile) shared_profile=1; shift ;;
+  --no-click-dismiss) click_dismiss=0; shift ;;
+  --anim-ms) anim_ms="${2:-}"; shift 2 ;;
+  *) echo "unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Les deux axes se reglent separement, `--margin` ne servant plus que de
+# defaut. La fenetre entrant par le COTE, la marge laterale et la marge sous la
+# barre n'ont plus la meme fonction visuelle.
+: "${margin_x:=$margin}"
+: "${margin_y:=$margin}"
+
+mkdir -p "$STATE_DIR"
+
+# --- une invocation a la fois ------------------------------------------------
+#
+# Le widget appelle `hide` a CHAQUE changement de focus : deux invocations se
+# chevauchent facilement. Or `toggle_special` est une bascule — la seconde
+# rouvrait la reserve que la premiere venait de fermer, et la fenetre restait a
+# l'ecran alors que tout se disait « rangee ». Constate a l'usage.
+#
+# Attente courte : passe ce delai, c'est qu'une autre invocation fait deja le
+# travail. Toutes les actions sont idempotentes, abandonner est correct.
+exec 9>"$STATE_DIR/lock"
+flock -w 3 9 || exit 0
+
+# --- navigateur -------------------------------------------------------------
+# Seule la famille Chromium sait ouvrir une fenetre sans interface (--app).
+# Firefox et Zen ne le peuvent pas : on retombe alors sur chromium, present
+# dans omarchy-base.packages, donc sur toute installation Omarchy.
+resolve_browser() {
+  if [[ -n $browser ]] && command -v "$browser" >/dev/null 2>&1; then
+    command -v "$browser"; return 0
+  fi
+
+  local desktop exec_bin
+  desktop=$(env -u BROWSER xdg-settings get default-web-browser 2>/dev/null || true)
+  [[ -z $desktop ]] && desktop=$(xdg-mime query default x-scheme-handler/https 2>/dev/null || true)
+
+  if [[ -n $desktop ]]; then
+    exec_bin=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' \
+      {"$HOME"/.local,"$HOME"/.nix-profile,/usr}/share/applications/"$desktop" 2>/dev/null | head -1)
+    if [[ -n $exec_bin ]] && command -v "$exec_bin" >/dev/null 2>&1 &&
+       "$exec_bin" --help 2>/dev/null | grep -q -- "--app"; then
+      command -v "$exec_bin"; return 0
+    fi
+  fi
+
+  local candidate
+  for candidate in chromium google-chrome-stable google-chrome brave microsoft-edge-stable; do
+    if command -v "$candidate" >/dev/null 2>&1; then command -v "$candidate"; return 0; fi
+  done
+
+  echo "no --app capable browser found (chromium required)" >&2
+  return 1
+}
+
+stored_class() { [[ -f $CLASS_FILE ]] && cat "$CLASS_FILE" || true; }
+
+# La fenetre appartient-elle a notre profil dedie ?
+# `$(< fichier)` est une redirection interne a bash : aucun processus lance,
+# donc utilisable sur le chemin critique. Les octets NUL sont ecartes par bash,
+# ce qui colle les arguments entre eux — sans consequence pour un test de
+# sous-chaine.
+owns_window() {
+  local pid="$1" cmd
+  [[ -n $pid && $pid != 0 && -r /proc/$pid/cmdline ]] || return 1
+  # Les avertissements « octet nul ignore » de bash sont attendus et sans
+  # consequence ici : on les tait plutot que de lancer un `tr`.
+  { cmd=$(< "/proc/$pid/cmdline"); } 2>/dev/null || return 1
+  [[ $cmd == *"--user-data-dir=$PROFILE_DIR"* ]]
+}
+stored_addr()  { [[ -f $ADDR_FILE  ]] && cat "$ADDR_FILE"  || true; }
+
+# --- lecture d'etat ---------------------------------------------------------
+#
+# UNE seule lecture par invocation. `hyprctl -j --batch 'clients;monitors'` rend
+# les deux documents JSON en un aller-retour (~9 ms), et un unique jq (~4 ms) en
+# tire tout ce dont le script a besoin : identite de la fenetre, geometrie
+# courante, geometrie visee, visibilite, workspace focalise.
+#
+# Pourquoi plus python3 : chaque demarrage de python3 coute ~26 ms et le chemin
+# d'affichage en enchainait six, ce qui portait l'affichage a ~300 ms alors que
+# l'objectif est qu'il soit instantane. Mesure apres bascule sur jq : ~60 ms.
+read -r -d '' JQ_STATE <<'JQ_EOF' || true
+. as [$clients, $monitors]
+
+# L'adresse memorisee n'est acceptee que si la classe correspond aussi. Une
+# adresse Hyprland est un pointeur, que Hyprland peut reattribuer a une fenetre
+# de l'utilisateur apres fermeture ; sans ce recoupement, focus_window validerait
+# une cible qui n'est pas la notre, et les dispatchers geometriques retomberaient
+# sur une fenetre de l'utilisateur — le bug dangereux, par une autre porte.
+| (if $addr != "" and $cls != ""
+   then ($clients | map(select(.address == $addr and .class == $cls)) | first)
+   else null end) as $byaddr
+| ($byaddr
+   // (if $cls != "" then ($clients | map(select(.class == $cls)) | first) else null end)
+  ) as $c
+
+# Ecran de reference.
+#   ref = "window"  : celui ou la fenetre se trouve deja (reposition).
+#                     Se caler sur l'ecran focalise faisait sauter la fenetre
+#                     d'un ecran a l'autre alors que l'utilisateur n'avait fait
+#                     que bouger la souris.
+#   ref = "focused" : celui ou la fenetre va etre posee (show).
+| ($monitors | map(select(.focused)) | first // $monitors[0]) as $fm
+| (if $ref == "focused" then $fm
+   else ((if $c != null then ($monitors | map(select(.id == $c.monitor)) | first) else null end) // $fm)
+   end) as $m
+
+| (($m.scale // 1) | if . == 0 then 1 else . end) as $scale
+| (($m.width  / $scale) | floor) as $sw
+| (($m.height / $scale) | floor) as $sh
+# reserved = [gauche, haut, droite, bas] : la place que la barre s'est reservee.
+| ($m.reserved // [0,0,0,0]) as $res
+| $res[1] as $top
+| $res[3] as $bot
+| ($m.x + $gx)                   as $lx
+| ($m.x + $sw - $w - $gx)        as $rx
+| ($m.y + $top + $gy)            as $ty
+| ($m.y + $sh - $bot - $h - $gy) as $by
+| ($m.x + (($sw - $w) / 2 | floor))                      as $mx
+| ($m.y + $top + (($sh - $top - $bot - $h) / 2 | floor)) as $my
+| {"center":[$mx,$my], "top":[$mx,$ty], "bottom":[$mx,$by],
+   "left":[$lx,$my], "right":[$rx,$my], "top-left":[$lx,$ty],
+   "top-right":[$rx,$ty], "bottom-left":[$lx,$by], "bottom-right":[$rx,$by]} as $t
+| ($t[$pos] // $t["top-right"]) as $xy
+
+# « Rangee dans la reserve » ne suffit PAS a dire « invisible » : un special
+# workspace peut etre OUVERT sur un ecran, et sa fenetre est alors bien a
+# l'ecran. Hyprland l'ouvre justement tout seul quand on y envoie la fenetre
+# focalisee — ce qui est exactement ce que fait hide(). On sort donc les deux
+# faits separement, et la visibilite se deduit des deux.
+| ("special:" + $special) as $spname
+| ($monitors | map(select(.specialWorkspace.name == $spname)) | first) as $spmon
+
+| [ (if $c == null then "" else $c.address end),
+    (if $c == null then false else $c.floating end),
+    (if $c == null then 0 else $c.size[0] end),
+    (if $c == null then 0 else $c.size[1] end),
+    (if $c == null then 0 else $c.at[0] end),
+    (if $c == null then 0 else $c.at[1] end),
+    ([$m.x, $xy[0]] | max),
+    ([$m.y, $xy[1]] | max),
+    (if $c == null then 0 else $c.pid end),
+    (if $c == null then false else ($c.workspace.name == $spname) end),
+    (if $spmon == null then "" else $spmon.name end),
+    $fm.activeWorkspace.id,
+    $m.y,
+    # Bord hors ecran d'ou la fenetre entre : le PLUS PROCHE, pour que le
+    # trajet reste court. La barre est horizontale, donc entrer par un cote
+    # ne croise jamais son bandeau.
+    (if ($xy[0] + ($w / 2)) >= ($m.x + ($sw / 2))
+     then $m.x + $sw + 20
+     else $m.x - $w - 20 end) ]
+
+# Separateur = US (unite, \u001f), PAS une tabulation : `read` traite la
+# tabulation comme un espacement, fusionne les separateurs consecutifs et
+# PERD les champs vides. Un ecran non renseigne decalait alors toute la ligne
+# — le workspace de destination devenait vide et `show` ne sortait plus la
+# fenetre de la reserve.
+| map(tostring) | join("\u001f")
+JQ_EOF
+
+addr=""; float=""; cur_w=""; cur_h=""; cur_x=""; cur_y=""
+tgt_x=""; tgt_y=""; pid=""; in_special=""; special_mon=""; focused_ws=""; vis=""
+mon_y=""; off_x=""
+
+read_state() {
+  local ref="${1:-window}" line
+  line=$(hyprctl -j --batch 'clients;monitors' | jq -s -r \
+    --arg addr "$(stored_addr)" --arg cls "$(stored_class)" \
+    --arg special "$SPECIAL" --arg pos "$position" --arg ref "$ref" \
+    --argjson w "$width" --argjson h "$height" \
+    --argjson gx "$margin_x" --argjson gy "$margin_y" \
+    "$JQ_STATE")
+
+  # Separateur US : voir la note dans JQ_STATE. Tout caractere d'espacement
+  # (tabulation comprise) ferait perdre les champs vides a `read`.
+  IFS=$'\x1f' read -r addr float cur_w cur_h cur_x cur_y tgt_x tgt_y \
+    pid in_special special_mon focused_ws mon_y off_x <<<"$line"
+
+  # PREUVE DE PROPRIETE. La classe ne suffit pas a prouver que la fenetre est
+  # la notre : Chromium la fabrique a partir de l'URL, donc une fenetre que
+  # l'utilisateur aurait lui-meme ouverte sur le meme tableau de bord (chromium
+  # --app) porterait exactement la meme. Le script l'aurait alors deplacee et
+  # redimensionnee — verifie, la fenetre temoin a bien ete emportee avant ce
+  # controle.
+  #
+  # On exige donc que le processus de la fenetre utilise NOTRE profil dedie.
+  # Avec un profil partage, cette preuve n'existe pas : on s'en tient a l'etat
+  # memorise, qui n'est ecrit que par nos propres lancements.
+  if [[ -n $addr ]] && ((!shared_profile)) && ! owns_window "$pid"; then
+    addr=""; vis="absente"
+  fi
+
+  # Visible = presente, et soit hors de la reserve, soit dans une reserve
+  # actuellement ouverte sur un ecran.
+  if   [[ -z $addr ]];                                 then vis="absente"
+  elif [[ $in_special == true && -z $special_mon ]];    then vis="cachee"
+  else                                                      vis="visible"
+  fi
+
+  # Etat perdu ou corrompu : tenter le rattrapage par ligne de commande, puis
+  # relire une seule fois. `$1` vaut alors "recovered", ce qui coupe la boucle.
+  if [[ $vis == absente && ${2:-} != "recovered" ]]; then
+    local found
+    if found=$(recover_window); then
+      printf '%s' "$found" > "$ADDR_FILE"
+      # printf, pas une redirection de jq : `stored_class` lit avec cat, un
+      # saut de ligne final ferait echouer toutes les comparaisons de classe.
+      printf '%s' "$(hyprctl clients -j | jq -r --arg a "$found" \
+        'map(select(.address == $a)) | first | .class // ""')" > "$CLASS_FILE"
+      read_state "$ref" recovered
+      return 0
+    fi
+  fi
+
+  # L'adresse retrouvee par la classe peut differer de celle memorisee : on la
+  # reecrit, c'est elle que le widget de barre lit pour connaitre l'etat reel.
+  [[ -n $addr && $addr != "$(stored_addr)" ]] && printf '%s' "$addr" > "$ADDR_FILE"
+  return 0
+}
+
+# --- fermeture au CLIC en dehors ---------------------------------------------
+#
+# Le focus est le mauvais signal : cette machine a `input:follow_mouse = 1`, donc
+# survoler une autre fenetre change le focus et la vue se fermait au simple
+# mouvement de souris.
+#
+# Les panneaux d'Omarchy s'en sortent avec HyprlandFocusGrab, mais il ne prend
+# que des fenetres QUICKSHELL — notre vue est une vraie fenetre Chromium, le
+# motif ne se transpose pas.
+#
+# D'ou un bind souris NON CONSOMMANT, pose seulement pendant que la vue est
+# affichee : le clic continue d'atteindre l'application visee, et on decide
+# ensuite s'il tombait en dehors de la vue.
+#
+# `non_consuming` est le SEUL nom d'option qui marche. `nonconsuming` et
+# `flags = "n"` sont acceptes par hyprctl (« ok ») mais silencieusement
+# IGNORES — verifie avec `hyprctl binds -j`.
+arm_click() {
+  ((click_dismiss)) || return 0
+  # `hl.bind` ne remplace pas : il EMPILE. Deux `show` d'affilee posaient
+  # deux binds, et un seul clic lancait alors deux `ha-window click`.
+  # Verifie avec `hyprctl binds -j` (le compte montait a 2, 3, ...).
+  disarm_click
+  hyprctl eval \
+    "hl.bind(\"$CLICK_BUTTON\", hl.dsp.exec_cmd(\"$SELF click\"), { non_consuming = true })" \
+    >/dev/null 2>&1
+}
+
+# `hl.unbind` ne retire que le bind SANS modificateur : le « Move window »
+# d'Omarchy (SUPER + mouse:272, modmask 64) est preserve. Verifie.
+disarm_click() {
+  hyprctl eval "hl.unbind(\"$CLICK_BUTTON\")" >/dev/null 2>&1
+}
+
+click_outside() {
+  read_state window
+  # Vue fermee (ou fenetre disparue) : le bind n'a plus lieu d'etre.
+  [[ $vis == visible ]] || { disarm_click; return 0; }
+
+  local cx cy
+  # HA_CLICK_AT="X Y" court-circuite la position du pointeur. Uniquement pour
+  # les tests : `hyprctl dispatch movecursor` ne deplace PAS le curseur sur
+  # cette machine, il n'y a donc aucun autre moyen de verifier le decoupage
+  # dedans / barre / ailleurs sans un vrai clic humain.
+  if [[ -n ${HA_CLICK_AT:-} ]]; then
+    read -r cx cy <<<"$HA_CLICK_AT"
+  else
+    read -r cx cy < <(hyprctl cursorpos -j | jq -r '"\(.x) \(.y)"')
+  fi
+  [[ -n ${cy:-} ]] || return 0
+
+  # Clic DANS la vue : ne rien faire.
+  (( cx >= cur_x && cx < cur_x + cur_w && cy >= cur_y && cy < cur_y + cur_h )) && return 0
+
+  # Clic dans une zone reservee par la barre (ou tout autre panneau) : c'est
+  # l'affaire du widget, pas la notre. Sans ca, cliquer sur l'icone declenchait
+  # a la fois ce masquage et le `toggle` du widget, qui rouvrait aussitot.
+  local in_bar
+  in_bar=$(hyprctl monitors -j | jq -r --argjson x "$cx" --argjson y "$cy" '
+    map(select($x >= .x and $x < .x + .width and $y >= .y and $y < .y + .height))
+    | first
+    | if . == null then "non"
+      elif ($y < .y + .reserved[1]) or ($y >= .y + .height - .reserved[3])
+        or ($x < .x + .reserved[0]) or ($x >= .x + .width - .reserved[2])
+      then "oui" else "non" end')
+  [[ $in_bar == oui ]] && return 0
+
+  hide
+}
+
+# Retrouve la fenetre SANS aucun fichier d'etat, en interrogeant la ligne de
+# commande des processus : la fenetre HA est celle dont le navigateur a ete
+# lance avec `--app=<url configuree>`.
+#
+# C'est le rattrapage quand l'etat memorise est perdu ou corrompu. Sans lui,
+# `show` ne reconnaissait pas la fenetre existante et en lancait une DE PLUS a
+# chaque appel — verifie, quatre fenetres accumulees en un test.
+#
+# LIMITE : toutes les fenetres d'un meme profil Chromium partagent UN SEUL
+# processus. Le PID identifie donc le profil, pas la fenetre. S'il en existait
+# plusieurs, on adopte la premiere — elles affichent de toute facon le meme
+# tableau de bord. Ce rattrapage empeche d'en creer d'autres, il ne fait pas
+# le menage de celles deja la.
+recover_window() {
+  [[ -n $url ]] || return 1
+
+  # JAMAIS avec un profil partage. Toutes les fenetres d'un profil Chromium
+  # partagent un seul processus : si c'est notre lancement qui l'a demarre, sa
+  # ligne de commande porte `--app=<url>` et TOUTES les fenetres de
+  # l'utilisateur correspondraient — le rattrapage adopterait une fenetre a lui,
+  # et les dispatchers geometriques la deplaceraient. Avec un profil partage on
+  # s'en tient donc a l'etat memorise.
+  ((shared_profile)) && return 1
+  # Meme preuve de propriete que l'identification normale : le processus doit
+  # utiliser notre profil dedie. C'est plus sur que de comparer l'URL, et c'est
+  # le seul critere qui distingue notre fenetre d'une fenetre que l'utilisateur
+  # aurait ouverte lui-meme sur le meme tableau de bord.
+  #
+  # Separateur « : » : une adresse Hyprland (0x...) et un PID (chiffres) n'en
+  # contiennent jamais.
+  local a p
+  while IFS=: read -r a p; do
+    if owns_window "$p"; then printf '%s' "$a"; return 0; fi
+  done < <(hyprctl clients -j | jq -r '
+    .[] | select(.class // "" | startswith("chrome")) | "\(.address):\(.pid)"')
+  return 1
+}
+
+# Referme la reserve si elle est restee ouverte sur un ecran.
+#
+# `hl.dsp.workspace.toggle_special` est une BASCULE et agit sur l'ecran
+# FOCALISE : l'appeler alors que la reserve est ouverte sur un AUTRE ecran
+# l'ouvrirait la ou on se trouve, au lieu de la fermer. On focalise donc
+# d'abord l'ecran concerne, et on verifie le resultat.
+close_special() {
+  # RELIRE juste avant d'agir, sans se fier a `$special_mon` d'une lecture
+  # anterieure : `toggle_special` est une bascule, et refermer sur un etat
+  # perime ROUVRE la reserve au lieu de la fermer.
+  local mon
+  mon=$(hyprctl monitors -j | jq -r --arg n "special:$SPECIAL" \
+    'map(select(.specialWorkspace.name == $n)) | first | .name // ""')
+  [[ -n $mon ]] || return 0
+
+  # La bascule agit sur l'ecran FOCALISE : l'appeler alors que la reserve est
+  # ouverte sur un AUTRE ecran l'ouvrirait la ou on se trouve.
+  hyprctl --batch \
+    "dispatch hl.dsp.focus({ monitor = \"$mon\" }) ; dispatch hl.dsp.workspace.toggle_special(\"$SPECIAL\")" \
+    >/dev/null 2>&1
+
+  local still
+  still=$(hyprctl monitors -j | jq -r --arg n "special:$SPECIAL" \
+    '[.[] | select(.specialWorkspace.name == $n)] | length')
+  [[ $still == 0 ]] || { echo "the reserve stayed open on a monitor" >&2; return 1; }
+}
+
+# --- GARDE-FOU CENTRAL ------------------------------------------------------
+#
+# Les dispatchers geometriques de Hyprland (float, resize, move) agissent sur
+# la fenetre ACTIVE, pas sur une cible passee en argument. Il faut donc
+# focaliser la fenetre HA avant chacun — et surtout VERIFIER que le focus a
+# bien atterri dessus.
+#
+# Sans cette verification, un echec silencieux (etat obsolete, fenetre fermee,
+# fichier d'etat efface) faisait porter le redimensionnement, le deplacement et
+# l'envoi en workspace invisible sur la fenetre de l'utilisateur — ses
+# applications disparaissaient de l'ecran.
+#
+# INVARIANTE A CONSERVER : aucun dispatcher sans cible confirmee.
+focus_window() {
+  local target="$1" active
+  [[ -n $target ]] || return 1
+
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$target\" })" >/dev/null 2>&1
+
+  active=$(hyprctl activewindow -j | jq -r '.address // ""')
+  [[ $active == "$target" ]] || {
+    echo "focus not acquired (target $target, active ${active:-none})" >&2
+    return 1
+  }
+}
+
+# --- animation ----------------------------------------------------------
+#
+# L'animation est faite ICI, pas par Hyprland. Verifie le 2026-09-01 :
+# `show` et `hide` ne declenchent AUCUNE animation du compositeur (les leaves
+# specialWorkspace, windowsMove et windowsIn portees a 4 s ne changent rien),
+# et de toute facon la duree d'une animation Hyprland est GLOBALE — impossible
+# d'en faire un reglage du plugin sans ralentir tout le bureau.
+#
+# On deplace donc la fenetre nous-memes, image par image. Mesure : un
+# `hyprctl dispatch` coute 6 ms, soit de la marge pour tenir 60 images/s.
+
+# Pause sans lancer /usr/bin/sleep : `read -t` est un builtin. Il lui faut un
+# descripteur qui ne delivre RIEN et ne se ferme JAMAIS — un tube nomme ouvert
+# en lecture-ecriture. `<(:)` ne convient pas : il atteint EOF aussitot et
+# `read` rend la main sans attendre (mesure : 60 pauses de 16 ms en 0 s).
+#
+# Mesure avec le tube : 60 x 16 ms = 0,974 s pour 6 ms de CPU, contre 1,041 s
+# et 78 ms de CPU avec /usr/bin/sleep.
+SLEEP_FD=""
+open_snooze() {
+  local f="$STATE_DIR/tick.$$"
+  mkfifo -m 600 "$f" 2>/dev/null || return 1
+  exec {SLEEP_FD}<>"$f"
+  rm -f "$f"
+}
+# `|| true` INDISPENSABLE : `read -t` qui expire sort en 142, et `set -e`
+# tuait le script des la premiere image du glissement (constate : la fenetre
+# restait figee a la position de la premiere image, hors ecran).
+snooze() {
+  if [[ -n $SLEEP_FD ]]; then read -t "$1" -u "$SLEEP_FD" _ 2>/dev/null || true
+  else sleep "$1" || true
+  fi
+  return 0
+}
+
+# slide FROM_Y TO_Y X — glisse verticalement en $anim_ms, easing easeOutCubic
+# (depart franc, arrivee amortie), qui est ce qui donne l'impression de
+# « depliage » plutot que de translation mecanique.
+# HYPRLAND NE DOIT PAS ANIMER CETTE FENETRE — sinon il anime nos propres
+# images et tout se deregle :
+#
+#  - Sortir la fenetre de la reserve la REPLACE a son ancienne position (y=32
+#    constate) avant notre `move` de depart. Anime, ce saut se voit : la
+#    fenetre apparaissait a sa place, MONTAIT, puis redescendait.
+#  - Chaque image de notre glissement relancait une animation de 380 ms : la
+#    position rendue trainait tres loin derriere la position logique.
+#
+# `no_anim = true` est la seule forme qui marche. `animation = "none"` est
+# accepte (« ok ») mais IGNORE — verifie en A/B avec `windowsMove` ralenti a
+# 4 s : sans la regle la fenetre rampe, avec `no_anim` elle saute d'un coup.
+#
+# La regle s'applique DYNAMIQUEMENT, meme a une fenetre deja ouverte.
+#
+# Posee une seule fois par instance Hyprland : `hl.window_rule` EMPILE, comme
+# `hl.bind`, et rien ne permet de lister ni de retirer une regle de fenetre.
+# Un `hyprctl reload` la perd sans changer la signature d'instance ; le
+# prochain lancement du navigateur (prechauffage au demarrage du shell) la
+# repose.
+ensure_no_anim() {
+  local cls; cls=$(stored_class)
+  [[ -n $cls ]] || return 0
+  local mark="$STATE_DIR/noanim.${HYPRLAND_INSTANCE_SIGNATURE:-inconnue}"
+  [[ -f $mark ]] && return 0
+  hyprctl eval "hl.window_rule({ match = { class = \"$cls\" }, no_anim = true })" \
+    >/dev/null 2>&1
+  : > "$mark"
+}
+
+# Horloge en millisecondes SANS processus : `EPOCHREALTIME` est une variable
+# de bash. Le separateur decimal suit la LOCALE (virgule en francais), d'ou la
+# substitution.
+now_ms() {
+  local t=${EPOCHREALTIME/,/.}
+  echo $(( ${t%.*} * 1000 + 10#${t#*.} / 1000 ))
+}
+
+# Le nombre d'images n'est PAS fixe d'avance : on se cale sur l'horloge et on
+# saute les images en retard. Une cadence fixe donnait 930 ms pour une
+# animation demandee a 500 ms — le cout d'un `hyprctl dispatch` (6 ms) et de la
+# pause s'ajoutaient a chaque image.
+#
+# Cadence visee : 7 ms, soit ~144 img/s, la frequence de l'ecran. Mesure : un
+# `hyprctl dispatch` coute 5,9 ms, donc ~170 img/s sont atteignables. Une pause
+# fixe de 12 ms plafonnait a ~55 img/s — c'est ce qui se voyait.
+#
+# ON DEPLACE, ON NE REDIMENSIONNE PAS. Un `move` ne coute rien au navigateur ;
+# un `resize` le force a remettre la page en page a chaque image, et surtout
+# CHROMIUM PLANTE (SIGTRAP) sous un flot rapide de redimensionnements —
+# verifie : 120 redimensionnements d'affilee le tuent, meme entre 300 et
+# 900 px, alors que les memes descentes jusqu'a 1 px espacees de 0,6 s ne lui
+# font rien. C'est le rythme, pas la taille.
+#
+# ENTREE PAR LE COTE, pas par le haut. La barre d'Omarchy est bien au-dessus
+# des fenetres, mais son fond est TRANSPARENT (`bar.transparent: true`) : une
+# fenetre qui glissait depuis le haut se voyait a travers le bandeau, entre les
+# icones. Entrer par le bord lateral le plus proche ne croise jamais la barre,
+# et laisse son fond transparent intact.
+FRAME_MS=7
+# slide FROM_X TO_X Y — glissement HORIZONTAL, easeOutCubic.
+slide() {
+  local from="$1" to="$2" y="$3"
+  ((anim_ms > 0)) || return 0
+  [[ -n $addr ]] || return 0
+  [[ -n $SLEEP_FD ]] || open_snooze || true
+
+  local start el t e x spent rest st
+  start=$(now_ms)
+  while :; do
+    el=$(( $(now_ms) - start ))
+    ((el >= anim_ms)) && break
+    # easeOutCubic sur 1000 : e = 1000 - (1000-t)^3 / 1000000
+    t=$((el * 1000 / anim_ms))
+    e=$((1000 - (1000 - t) * (1000 - t) * (1000 - t) / 1000000))
+    x=$((from + (to - from) * e / 1000))
+    hyprctl dispatch "hl.dsp.window.move({ window = \"address:$addr\", x = $x, y = $y })" \
+      >/dev/null 2>&1
+    # Dormir le RESTE de l'image, pas une duree fixe.
+    spent=$(( $(now_ms) - start - el ))
+    rest=$(( FRAME_MS - spent ))
+    if ((rest > 0)); then printf -v st "0.%03d" "$rest"; snooze "$st"; fi
+  done
+
+  # Image finale exacte : la boucle s'arrete sur le temps, pas sur la position.
+  hyprctl dispatch "hl.dsp.window.move({ window = \"address:$addr\", x = $to, y = $y })" \
+    >/dev/null 2>&1
+}
+
+# Construit la sequence de dispatchers geometriques, en n'incluant que ce qui
+# differe deja : sur une fenetre correctement placee, la sequence est vide et
+# aucun dispatcher n'est envoye.
+#
+# `hl.dsp.window.float()` est une BASCULE : ne l'emettre que si la fenetre n'est
+# pas deja flottante.
+# Chaque dispatcher NOMME sa cible (`window = "address:..."`). C'est ce qui
+# remplace l'ancien garde-fou « focaliser d'abord, puis agir sur la fenetre
+# active » : la cible est designee explicitement, elle ne peut plus etre une
+# fenetre de l'utilisateur. Verifie — une autre fenetre focalisee n'est pas
+# touchee, et le focus n'est pas vole.
+geometry_cmds() {
+  local cmds="" tgt="{ window = \"address:$addr\""
+  [[ $float != true ]] && cmds+="dispatch hl.dsp.window.float($tgt }) ; "
+  [[ $cur_w != "$width" || $cur_h != "$height" ]] &&
+    cmds+="dispatch hl.dsp.window.resize($tgt, x = $width, y = $height }) ; "
+  [[ $cur_x != "$tgt_x" || $cur_y != "$tgt_y" ]] &&
+    cmds+="dispatch hl.dsp.window.move($tgt, x = $tgt_x, y = $tgt_y }) ; "
+  printf '%s' "${cmds%% ; }"
+}
+
+reposition() {
+  read_state window
+  [[ $vis != absente ]] || { echo "geometry skipped: HA window not found" >&2; return 1; }
+
+  local cmds; cmds=$(geometry_cmds)
+  [[ -n $cmds ]] || return 0
+
+  # SANS focus, volontairement : `reposition` est appele en direct pendant que
+  # le panneau de reglages est ouvert (apercu des tailles). Focaliser la vue
+  # volerait le focus au panneau, dont le HyprlandFocusGrab le refermerait.
+  hyprctl --batch "$cmds" >/dev/null 2>&1
+}
+
+launch() {
+  local bin before after new_addr cls args=()
+  bin=$(resolve_browser) || exit 1
+  [[ -n $url ]] || { echo "no URL configured" >&2; exit 1; }
+
+  before=$(hyprctl clients -j | jq -r '[.[].address] | join(" ")')
+
+  args=(--app="$url" --no-first-run --no-default-browser-check
+        --disable-session-crashed-bubble --hide-crash-restore-bubble --noerrdialogs)
+  ((shared_profile)) || args+=(--user-data-dir="$PROFILE_DIR")
+  # `9>&-` ferme le descripteur du verrou AVANT exec : sans cela le
+  # navigateur HERITE du fd 9 et garde le flock pour toute sa duree de vie.
+  # Toutes les invocations suivantes (toggle, hide, click) expiraient alors
+  # sur `flock -w 3` et sortaient en silence — le plugin devenait inerte.
+  setsid "$bin" "${args[@]}" >/dev/null 2>&1 < /dev/null 9>&- &
+  disown
+
+  # Chromium peut mettre plusieurs secondes a mapper sa fenetre : demarrage a
+  # froid du profil, initialisation GPU. 60 s de patience, sinon un premier
+  # lancement lent passerait pour un echec.
+  for _ in $(seq 1 240); do
+    new_addr=$(hyprctl clients -j | jq -r --arg before "$before" '
+      ($before | split(" ")) as $seen
+      | map(select((.address as $a | $seen | index($a) | not)
+                   and (.class // "" | startswith("chrome"))))
+      | first | .address // ""')
+    [[ -n $new_addr ]] && break
+    sleep 0.25
+  done
+
+  [[ -n $new_addr ]] || {
+    echo "the window never appeared" >&2
+    echo "  (invalid URL? Chromium then falls back to a normal window)" >&2
+    return 1
+  }
+
+  cls=$(hyprctl clients -j | jq -r --arg a "$new_addr" '
+    map(select(.address == $a)) | first | .class // ""')
+  printf '%s' "$cls" > "$CLASS_FILE"
+  printf '%s' "$new_addr" > "$ADDR_FILE"
+  rm -f "$STATE_DIR"/noanim.* 2>/dev/null || true
+  ensure_no_anim
+
+  # Geometrie posee ici une fois pour toutes, puis la fenetre part en reserve.
+  reposition || true
+  focus_window "$new_addr" || return 1
+  hyprctl dispatch "hl.dsp.window.move({ workspace = \"special:$SPECIAL\" })" >/dev/null 2>&1
+  close_special || true
+}
+
+# Chemin critique. Une seule lecture d'etat, un seul lot de dispatchers.
+#
+# Le referentiel est l'ecran FOCALISE : la fenetre va y etre posee, elle
+# s'affiche donc la ou on regarde au moment du clic, et n'en bouge plus ensuite.
+show() {
+  read_state focused
+  if [[ $vis == absente ]]; then
+    launch || return 1
+    read_state focused
+    [[ $vis != absente ]] || { echo "show cancelled: HA window not found" >&2; return 1; }
+  fi
+
+  # PAS DE FOCUS AVANT LE DEPLACEMENT. Focaliser une fenetre rangee dans une
+  # reserve fermee OUVRE la reserve, dont l'animation `slidevert` la fait
+  # monter depuis le BAS de l'ecran — puis notre glissement la faisait
+  # redescendre. C'est le « elle part du bas avant de redescendre » constate.
+  # Verifie par sondage de `hyprctl monitors` : sortie de reserve avec cible
+  # nommee et sans focus prealable, la reserve ne s'ouvre jamais.
+  #
+  # Le focus est donc pose EN FIN de lot, quand la fenetre est deja sortie.
+
+  # La fenetre est posee HORS ECRAN, au-dela du bord lateral le plus proche,
+  # puis entre. Elle n'apparait donc jamais d'un coup a sa place finale.
+  local start_x="$tgt_x"
+  ((anim_ms > 0)) && { ensure_no_anim; start_x="$off_x"; }
+
+  local tgt="{ window = \"address:$addr\""
+  local cmds="dispatch hl.dsp.window.move($tgt, workspace = \"$focused_ws\" })"
+  [[ $float != true ]] && cmds+=" ; dispatch hl.dsp.window.float($tgt })"
+  [[ $cur_w != "$width" || $cur_h != "$height" ]] &&
+    cmds+=" ; dispatch hl.dsp.window.resize($tgt, x = $width, y = $height })"
+  cmds+=" ; dispatch hl.dsp.window.move($tgt, x = $start_x, y = $tgt_y })"
+  cmds+=" ; dispatch hl.dsp.focus($tgt })"
+  hyprctl --batch "$cmds" >/dev/null 2>&1
+
+  slide "$start_x" "$tgt_x" "$tgt_y"
+
+  arm_click
+}
+
+hide() {
+  read_state window
+  [[ $vis != absente ]] || return 0
+
+  # Idempotent, et surtout SANS focus quand la fenetre est deja rangee et la
+  # reserve fermee : focaliser une fenetre posee dans une reserve cachee la
+  # ferait apparaitre. Le widget appelle `hide` a chaque changement de focus,
+  # ce raccourci est donc le chemin le plus frequent.
+  [[ $vis == visible ]] || return 0
+
+  # Deja dans la reserve, mais la reserve est ouverte : rien a deplacer, il
+  # suffit de la refermer.
+  if [[ $in_special == true ]]; then disarm_click; close_special; return $?; fi
+
+  disarm_click
+
+  ensure_no_anim
+
+  # Sortie par le COTE avant le rangement : une fois hors ecran, l'envoi dans
+  # la reserve ne se voit plus.
+  slide "$cur_x" "$off_x" "$cur_y"
+
+  # UN SEUL LOT : focus, rangement, fermeture de la reserve.
+  #
+  # Envoyer la fenetre FOCALISEE dans la reserve y OUVRE la reserve (Hyprland
+  # garde visible la fenetre qui a le focus), et l'ouverture s'anime par le
+  # BAS — c'est le « elle reapparait en bas puis disparait par le bas ».
+  # Groupees dans le meme lot, l'ouverture et la fermeture sont traitees avant
+  # le rendu : la reserve ne s'ouvre jamais a l'ecran. Verifie par sondage.
+  #
+  # Le focus est REPOSE ici volontairement : c'est lui qui rend l'ouverture de
+  # la reserve certaine, donc le `toggle_special` qui suit deterministe. Sans
+  # focus, le mouvement n'ouvrirait pas la reserve et la bascule l'ouvrirait —
+  # exactement le piege deja connu.
+  hyprctl --batch \
+    "dispatch hl.dsp.focus({ window = \"address:$addr\" }) ; dispatch hl.dsp.window.move({ window = \"address:$addr\", workspace = \"special:$SPECIAL\" }) ; dispatch hl.dsp.workspace.toggle_special(\"$SPECIAL\")" \
+    >/dev/null 2>&1
+
+  # Filet idempotent : relit l'etat et ne ferme que si la reserve est restee
+  # ouverte.
+  close_special
+}
+
+case "$action" in
+# Prechauffage : lance la fenetre et la laisse CACHEE dans le special
+# workspace. Le premier clic sur l'icone devient alors un simple toggle du
+# compositeur — instantane — au lieu d'un demarrage de navigateur.
+prewarm)
+  # Le prechauffage RE-ARME la regle `no_anim` : c'est le seul point de
+  # recuperation apres un `hyprctl reload`, qui efface les regles de fenetre
+  # sans changer la signature d'instance. En pratique : `omarchy restart shell`.
+  rm -f "$STATE_DIR"/noanim.* 2>/dev/null || true
+  read_state window
+  [[ $vis != absente ]] || launch || exit 1
+  ensure_no_anim
+  ;;
+show) show ;;
+hide) hide ;;
+click) click_outside ;;
+# Pose/retire le bind a la demande du widget : pendant que le panneau de
+# reglages est ouvert, un clic dedans ne doit PAS refermer la vue.
+arm-click) read_state window; [[ $vis == visible ]] && arm_click || true ;;
+disarm-click) disarm_click ;;
+toggle)
+  read_state window
+  if [[ $vis == visible ]]; then hide; else show; fi
+  ;;
+reposition) reposition ;;
+quit)
+  read_state window
+  [[ -n $addr ]] && hyprctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" >/dev/null 2>&1
+  disarm_click
+  rm -f "$CLASS_FILE" "$ADDR_FILE" "$STATE_DIR"/noanim.*
+  ;;
+status)
+  read_state window
+  echo "class     : $(stored_class || echo '<unknown>')"
+  echo "address   : ${addr:-<not found>}"
+  echo "window    : $([[ $vis == absente ]] && echo missing || echo present)"
+  echo "visible   : $([[ $vis == visible ]] && echo yes || echo no)"
+  echo "in reserve: ${in_special:-false}"
+  echo "reserve   : $([[ -n $special_mon ]] && echo "OPEN on $special_mon" || echo closed)"
+  echo "geometry  : ${width}x${height} @ $position (margins x=$margin_x y=$margin_y)"
+  echo "current   : ${cur_w}x${cur_h} @ ${cur_x},${cur_y} (floating: ${float})"
+  echo "target    : ${tgt_x},${tgt_y}"
+  echo "url       : ${url:-<not configured>}"
+  echo "browser   : $(resolve_browser 2>/dev/null || echo "not found")"
+  echo "profile   : $( ((shared_profile)) && echo shared || echo "$PROFILE_DIR")"
+  ;;
+*) echo "unknown action: $action" >&2; exit 1 ;;
+esac

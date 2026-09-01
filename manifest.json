@@ -1,0 +1,180 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.idarius.homeassistant",
+  "name": "Home Assistant",
+  "version": "1.0.0",
+  "author": "idarius",
+  "license": "MIT",
+  "description": "Slide-in Home Assistant dashboard from the Omarchy bar: left-click to show or hide it, right-click to configure it.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Home Assistant",
+    "description": "Shows your Home Assistant dashboard in a slide-in window.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "url": "",
+      "width": 480,
+      "height": 900,
+      "position": "top-right",
+      "margin": 12,
+      "autoHide": true,
+      "prewarm": true,
+      "sharedProfile": false,
+      "animMs": 220,
+      "marginX": 12,
+      "marginY": 12,
+      "language": "auto"
+    },
+    "schema": [
+      {
+        "key": "url",
+        "type": "string",
+        "label": "Dashboard URL",
+        "description": "For example: http://homeassistant.local:8123/lovelace/0",
+        "defaultValue": ""
+      },
+      {
+        "key": "width",
+        "type": "integer",
+        "label": "Width (px)",
+        "min": 200,
+        "max": 4000,
+        "step": 10,
+        "defaultValue": 480
+      },
+      {
+        "key": "height",
+        "type": "integer",
+        "label": "Height (px)",
+        "min": 200,
+        "max": 4000,
+        "step": 10,
+        "defaultValue": 900
+      },
+      {
+        "key": "position",
+        "type": "enum",
+        "label": "Position",
+        "defaultValue": "top-right",
+        "options": [
+          {
+            "value": "top-left",
+            "label": "Top left"
+          },
+          {
+            "value": "top",
+            "label": "Top center"
+          },
+          {
+            "value": "top-right",
+            "label": "Top right"
+          },
+          {
+            "value": "left",
+            "label": "Left"
+          },
+          {
+            "value": "center",
+            "label": "Center"
+          },
+          {
+            "value": "right",
+            "label": "Right"
+          },
+          {
+            "value": "bottom-left",
+            "label": "Bottom left"
+          },
+          {
+            "value": "bottom",
+            "label": "Bottom center"
+          },
+          {
+            "value": "bottom-right",
+            "label": "Bottom right"
+          }
+        ]
+      },
+      {
+        "key": "marginX",
+        "type": "integer",
+        "label": "Side margin (px)",
+        "description": "Distance to the left or right screen edge.",
+        "min": 0,
+        "max": 400,
+        "step": 2,
+        "defaultValue": 12
+      },
+      {
+        "key": "marginY",
+        "type": "integer",
+        "label": "Vertical margin (px)",
+        "description": "Distance to the top or bottom edge, on top of the strip the bar reserves.",
+        "min": 0,
+        "max": 400,
+        "step": 2,
+        "defaultValue": 12
+      },
+      {
+        "key": "animMs",
+        "type": "integer",
+        "label": "Open duration (ms)",
+        "description": "Slide from the nearest screen edge. 0 = appear instantly.",
+        "min": 0,
+        "max": 1200,
+        "step": 20,
+        "defaultValue": 220
+      },
+      {
+        "key": "autoHide",
+        "type": "boolean",
+        "label": "Hide when clicking elsewhere",
+        "defaultValue": true
+      },
+      {
+        "key": "prewarm",
+        "type": "boolean",
+        "label": "Preload the window at startup",
+        "description": "Starts the browser in the background so the first click is instant.",
+        "defaultValue": true
+      },
+      {
+        "key": "sharedProfile",
+        "type": "boolean",
+        "label": "Use the browser's own profile",
+        "description": "Reuses your existing session instead of a dedicated profile. Avoids signing in again, but shares cookies and extensions.",
+        "defaultValue": false
+      },
+      {
+        "key": "language",
+        "type": "enum",
+        "label": "Language",
+        "description": "Interface language. Automatic follows your system locale.",
+        "defaultValue": "auto",
+        "options": [
+          {
+            "value": "auto",
+            "label": "Automatic"
+          },
+          {
+            "value": "en",
+            "label": "English"
+          },
+          {
+            "value": "fr",
+            "label": "Francais"
+          }
+        ]
+      }
+    ]
+  },
+  "homepage": "https://github.com/idarius/omarchy-homeassistant",
+  "repository": "https://github.com/idarius/omarchy-homeassistant"
+}
