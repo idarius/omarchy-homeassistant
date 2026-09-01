@@ -12,7 +12,7 @@ them.
 The interface is available in English and French; by default it follows your
 system locale.
 
-![The dashboard window docked to the top right of the screen](preview.png)
+![The dashboard window docked to the top right of the screen](preview.jpg)
 
 ## Install
 
