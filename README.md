@@ -12,6 +12,8 @@ them.
 The interface is available in English and French; by default it follows your
 system locale.
 
+![The dashboard window docked to the top right of the screen](preview.png)
+
 ## Install
 
 ```sh
@@ -25,7 +27,25 @@ The window uses a **dedicated browser profile**
 (`~/.local/share/omarchy-homeassistant`), so the first time you open it you will
 have to sign in to Home Assistant once. The session is kept in that profile
 afterwards. Turn on *Use the browser's own profile* if you would rather reuse
-your normal Chromium session — see the caveat under Settings.
+your normal Chromium session. See the caveat under Settings.
+
+## Remove
+
+```sh
+omarchy plugin remove io.github.idarius.homeassistant
+```
+
+That takes the widget out of the bar and deletes the plugin. Two things it
+leaves behind, because they are yours and removing a plugin should not throw
+away data:
+
+```sh
+rm -rf ~/.local/share/omarchy-homeassistant   # browser profile and session
+rm -rf ~/.local/state/omarchy/homeassistant   # window address and class
+```
+
+If the dashboard window happens to be running, close it first with
+`ha-window quit --url <URL>`, or just close the Chromium window.
 
 ## Settings
 
@@ -38,18 +58,18 @@ your normal Chromium session — see the caveat under Settings.
 | Vertical margin | Distance to the top or bottom edge, on top of the strip the bar reserves. |
 | Open duration | Slide duration in milliseconds. `0` makes the window appear instantly. |
 | Hide when clicking elsewhere | Off keeps the window up until you click the icon again. |
-| Preload the window at startup | Starts the browser hidden so the first click is instant. Costs memory and a little CPU while idle — see Resource use. |
+| Preload the window at startup | Starts the browser hidden so the first click is instant. Costs memory and a little CPU while idle; see Resource use. |
 | Use the browser's own profile | Reuses your existing Chromium session instead of a dedicated profile. Convenient, but it also **disables the ownership check** below. |
 | Language | Automatic, English or French. |
 
 ## How it works
 
 There is no embedded web view: `QtWebEngine` requires an initialisation call
-Quickshell does not make, and loading it kills the whole shell process — the
-bar, the notifications and the menus with it. So the dashboard is a real
+Quickshell does not make, and loading it kills the whole shell process, taking
+the bar, the notifications and the menus with it. So the dashboard is a real
 Chromium window in `--app` mode, parked in a Hyprland special workspace that
 acts as an invisible reserve. Showing it is a compositor operation, which is why
-it takes about 30–50 ms.
+it takes about 30 to 50 ms.
 
 The bar widget never assumes the window's state, it reads it from the
 compositor (`Quickshell.Hyprland`), so the icon stays correct even if the window
@@ -59,7 +79,7 @@ is closed or moved by other means.
 moving or resizing anything: the window's process must be running with the
 plugin's own `--user-data-dir`. This matters because Chromium derives its window
 class from the URL, so a window you opened yourself on the same dashboard would
-otherwise be indistinguishable — and would get moved and resized out from under
+otherwise be indistinguishable, and would get moved and resized out from under
 you. With *Use the browser's own profile* that proof cannot exist, and the
 plugin falls back to its stored state alone.
 
@@ -69,7 +89,7 @@ Measured with the dashboard loaded, 11 Chromium processes:
 
 | | Window hidden | Window shown |
 |---|---|---|
-| Resident memory (PSS) | 678 MiB | — |
+| Resident memory (PSS) | 678 MiB | n/a |
 | CPU | 2.8 % of one core | 3.6 % of one core |
 
 The dedicated profile takes about 195 MiB on disk. **Chromium does not idle down
@@ -122,8 +142,8 @@ Nothing else uses that animation unless you drive special workspaces yourself.
 Coming down from under the bar would mean animating the window's height, and
 Chromium crashes under a fast stream of resize events (verified: 120 resizes in
 a row kill it, even at large sizes). A side entrance costs the browser nothing
-and never crosses the bar — whose background is transparent by default, which is
-what made a top entrance look wrong.
+and never crosses the bar, whose background is transparent by default. That
+transparency is what made a top entrance look wrong.
 
 **Clicking elsewhere is detected with a non-consuming Hyprland mouse binding**,
 installed only while the window is on screen and removed as soon as it is
@@ -136,8 +156,8 @@ Nothing beyond Omarchy 4 itself: `chromium`, `jq` and `hyprctl` are all part of
 a stock install. The plugin writes only its own entry in
 `~/.config/omarchy/shell.json`, a little state in
 `~/.local/state/omarchy/homeassistant/`, and the browser profile in
-`~/.local/share/omarchy-homeassistant/`. It makes no network request of its own
-— only the browser talks to your Home Assistant.
+`~/.local/share/omarchy-homeassistant/`. It makes no network request of its
+own: only the browser talks to your Home Assistant.
 
 ## License
 
@@ -152,7 +172,7 @@ bash -n ~/.config/omarchy/plugins/io.github.idarius.homeassistant/ha-window
 omarchy restart shell
 ```
 
-`ha-window` must stay executable — the widget runs it directly.
+`ha-window` must stay executable: the widget runs it directly.
 
 Testing the outside-click logic without a real click:
 
