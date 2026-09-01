@@ -107,11 +107,29 @@ strict, bounded pattern first, and escaped on top of that; anything that does
 not match is discarded rather than used. Settings are re-validated inside
 `ha-window` itself (scheme and length for the URL, enumerated position, bounded
 integers), because `shell.json` can be edited by hand and the script can be
-called directly. State lives in a directory the script requires to be a real
-directory, owned by you, mode `0700`; state files are read only when they are
-regular files and written by atomic replacement, so a symlink dropped in their
-place is overwritten rather than followed. Every `hyprctl` call is
-time-bounded, and the global mouse binding is removed on any failed exit.
+called directly.
+
+State is handled by **file descriptor, not by pathname**. A check on a path is
+only true for the instant it is made: the directory, or any of its parents, can
+be replaced between the check and the use. So the state directory is verified,
+then opened once, and everything afterwards resolves through that descriptor
+(`/dev/fd/N/…`, the equivalent of `openat`), which no later rename can redirect.
+Individual files are opened before being checked, and the checks are made on the
+descriptor actually held; reads are capped at 256 bytes, and writes go through
+an atomic rename, which replaces a symlink instead of following it.
+
+**The window address is a file name, not a file content.** The bar widget needs
+it too, and Quickshell's `FileView` offers no size cap, so an oversized state
+file would have been read whole inside the bar process and a named pipe left in
+its place would have stalled it. `<state>/window/` therefore holds at most one
+empty entry whose name is the address; the widget lists names and never reads
+content.
+
+Timeouts bound time, not bytes, and the size of `hyprctl clients -j` is not
+bounded by anything — a window title is chosen by the application that owns it.
+Compositor JSON is therefore capped in bytes as well, and an overflow fails the
+invocation instead of being parsed. The global mouse binding is removed on any
+failed exit.
 
 ## Resource use
 

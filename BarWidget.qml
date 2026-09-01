@@ -1,7 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Hyprland
-import Quickshell.Io
+import Qt.labs.folderlistmodel
 import qs.Ui
 import "Strings.js" as Strings
 
@@ -25,7 +25,12 @@ BarWidget {
   moduleName: "io.github.idarius.homeassistant"
 
   readonly property string script: Qt.resolvedUrl("ha-window").toString().replace("file://", "")
-  readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/homeassistant"
+  // Meme chemin que `ha-window`, XDG_STATE_HOME compris — il ne l'etait pas.
+  readonly property string stateHome: {
+    var x = String(Quickshell.env("XDG_STATE_HOME") || "")
+    return x.length > 0 ? x : Quickshell.env("HOME") + "/.local/state"
+  }
+  readonly property string stateDir: root.stateHome + "/omarchy/homeassistant"
   readonly property string specialWorkspace: "special:homeassistant"
 
   readonly property string url: setting("url", "")
@@ -54,7 +59,8 @@ BarWidget {
 
   // --- etat reel de la fenetre -------------------------------------------
   //
-  // Identification par ADRESSE, ecrite par ha-window au lancement.
+  // Identification par ADRESSE, publiee par ha-window sous forme de NOM DE
+  // FICHIER (voir plus bas, FolderListModel).
   //
   // Pas par classe : Hyprland.toplevels expose bien `lastIpcObject` (donc la
   // classe), mais il reste vide pour toute fenetre apparue APRES le demarrage
@@ -106,16 +112,38 @@ BarWidget {
     && haToplevel.workspace !== null
     && String(haToplevel.workspace.name) !== root.specialWorkspace
 
-  FileView {
-    id: addressFile
-    path: root.stateDir + "/window-address"
-    watchChanges: true
-    printErrors: false
-    // `text()` est perime dans le signal de changement : passer par reload()
-    // puis onLoaded, comme le fait Color.qml.
-    onFileChanged: reload()
-    onLoaded: root.windowAddress = String(text()).trim()
-    onLoadFailed: root.windowAddress = ""
+  // L'ADRESSE EST UN NOM DE FICHIER, PAS UN CONTENU.
+  //
+  // La version precedente lisait `window-address` avec un `FileView`. Quickshell
+  // n'expose AUCUN plafond de taille dessus — verifie dans sa source : un
+  // fichier d'etat demesure aurait ete charge en entier DANS LE PROCESSUS DE LA
+  // BARRE, et un tube nomme depose a sa place aurait fait attendre l'ouverture.
+  // Le widget etait ainsi un second lecteur du meme etat, independant des
+  // controles du script et non borne.
+  //
+  // `ha-window` maintient donc `<etat>/window/`, qui contient au plus UNE entree
+  // VIDE dont le NOM est l'adresse. On ne lit plus que des noms — bornes par le
+  // systeme de fichiers — et jamais un contenu.
+  FolderListModel {
+    id: windowDir
+    folder: "file://" + root.stateDir + "/window"
+    showDirs: false
+    showHidden: false
+    nameFilters: ["0x*"]
+    onCountChanged: root.windowAddress = root.firstValidAddress()
+  }
+
+  // PIEGE VERIFIE : quand `folder` designe un repertoire INEXISTANT — le cas
+  // d'une installation neuve, avant le premier lancement — FolderListModel
+  // retombe silencieusement sur le repertoire courant du processus et en liste
+  // le contenu. La validation stricte du nom n'est donc pas un confort : c'est
+  // elle qui rend ce repli inoffensif.
+  function firstValidAddress() {
+    for (var i = 0; i < windowDir.count; i++) {
+      var name = String(windowDir.get(i, "fileName") || "")
+      if (/^0x[0-9a-f]{1,16}$/.test(name)) return name
+    }
+    return ""
   }
 
   // --- actions ------------------------------------------------------------

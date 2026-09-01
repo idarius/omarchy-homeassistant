@@ -46,9 +46,12 @@ SPECIAL="homeassistant"
 # Bouton gauche. Le bind est pose UNIQUEMENT pendant que la vue est affichee.
 CLICK_BUTTON="mouse:272"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/homeassistant"
-CLASS_FILE="$STATE_DIR/window-class"
-ADDR_FILE="$STATE_DIR/window-address"
 PROFILE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-homeassistant"
+# SD, CLASS_FILE et WINDOW_DIR sont poses par init_state_dir : ils passent tous
+# par le DESCRIPTEUR du repertoire d'etat, pas par son nom (voir plus bas).
+SD=""
+CLASS_FILE=""
+WINDOW_DIR=""
 
 url=""
 width=480
@@ -156,6 +159,53 @@ check_int "--anim-ms" "$anim_ms" 0 5000
 HYPR_TIMEOUT=5
 hy() { timeout "$HYPR_TIMEOUT" hyprctl "$@"; }
 
+# `timeout` borne le TEMPS, pas les OCTETS. Or la taille de `hyprctl clients -j`
+# n'est bornee par rien : le titre d'une fenetre est choisi par l'application
+# qui la possede, et le document est ensuite relu a chaque invocation, passe a
+# jq et repris dans des substitutions de commande. Une fenetre au titre
+# demesure suffirait donc a faire gonfler la memoire du script.
+#
+# hyprctl n'offre aucun plafond cote producteur : on coupe donc au consommateur
+# (`head -c`, qui ferme le tube et fait mourir hyprctl sur SIGPIPE), et on
+# ECHOUE proprement au lieu de travailler sur un document tronque.
+#
+# Mesure sur cette machine : clients 3,0 Kio, monitors 2,9 Kio. Le plafond est
+# a 2 Mio, soit ~700 fois la taille reelle.
+JSON_MAX=$((2 * 1024 * 1024))
+#
+# Deux details qui ont chacun coute un essai :
+#
+#  - on lit UN octet de plus que le plafond, sinon « pile a la limite » et
+#    « tronque » sont indistinguables ;
+#  - une sentinelle finale (`E`) est indispensable : `$( ... )` SUPPRIME les
+#    sauts de ligne finaux, si bien qu'une sortie tronquee pouvait repasser
+#    sous le plafond et echapper au controle. Constate.
+#
+hypr_json() {
+  local out n lc_set=0
+  # `head` ferme le tube avant la fin quand ca deborde ; c'est voulu, et
+  # `pipefail` ferait passer ce SIGPIPE pour une panne. Neutralise ici seulement.
+  out=$(set +o pipefail
+        timeout "$HYPR_TIMEOUT" hyprctl -j "$@" | head -c $((JSON_MAX + 1))
+        printf 'E')
+  out=${out%E}
+  [[ -n $out ]] || { echo "no answer from the compositor ($*)" >&2; return 1; }
+
+  # `${#out}` compte des CARACTERES. Sous une locale UTF-8, un titre de fenetre
+  # multi-octets fait donc SOUS-ESTIMER la taille et manquer la troncature —
+  # constate : 1025 octets lus, 1023 caracteres comptes. On mesure en octets, le
+  # temps du test seulement. LC_ALL n'est jamais exporte : le navigateur lance
+  # plus loin garderait sinon la locale C et changerait de langue.
+  [[ -v LC_ALL ]] && lc_set=1
+  LC_ALL=C
+  n=${#out}
+  if ((lc_set)); then LC_ALL="$LC_ALL"; else unset LC_ALL; fi
+
+  ((n <= JSON_MAX)) ||
+    { echo "compositor JSON exceeded $JSON_MAX bytes ($*)" >&2; return 1; }
+  printf '%s' "$out"
+}
+
 # --- etat sur disque ---------------------------------------------------------
 #
 # L'etat memorise sert a construire des commandes : un lien symbolique ou un
@@ -166,6 +216,21 @@ hy() { timeout "$HYPR_TIMEOUT" hyprctl "$@"; }
 # compris, qu'aucun autre code ne passe par `write_state_file`.
 umask 077
 
+# UN CONTROLE PAR NOM NE VAUT QUE POUR L'INSTANT OU IL EST FAIT. Entre le
+# `[[ -d ]]` et l'ouverture du fichier, le repertoire — ou n'importe lequel de
+# ses parents — peut etre remplace. La verification portait donc sur un objet
+# qui n'etait plus celui qu'on utilisait ensuite.
+#
+# Le repertoire est desormais OUVERT une fois pour toutes, et tout le reste
+# passe par son DESCRIPTEUR : `/dev/fd/$STATE_FD/nom` resout le nom RELATIVEMENT
+# a l'inode ouvert — c'est l'equivalent d'un `openat(dirfd, ...)`, que bash
+# n'expose pas autrement. Un echange du repertoire par son chemin, apres
+# l'ouverture, ne change plus rien a ce que le script lit et ecrit.
+#
+# Verifie : repertoire deplace puis recree avec un contenu piege, le fd continue
+# de voir l'original. mkdir, mktemp, mv, chmod et le globbing fonctionnent tous
+# a travers `/dev/fd/N`.
+STATE_FD=""
 init_state_dir() {
   [[ -L $STATE_DIR ]] && die "state path is a symlink, refusing to use it: $STATE_DIR"
   if [[ -e $STATE_DIR ]]; then
@@ -173,30 +238,89 @@ init_state_dir() {
   else
     mkdir -p "$STATE_DIR" || die "cannot create the state directory: $STATE_DIR"
   fi
-  [[ -O $STATE_DIR ]] || die "state directory is not owned by this user: $STATE_DIR"
-  chmod 700 "$STATE_DIR" || die "cannot set mode 0700 on $STATE_DIR"
+
+  exec {STATE_FD}<"$STATE_DIR" || die "cannot open the state directory: $STATE_DIR"
+  SD="/dev/fd/$STATE_FD"
+
+  # A partir d'ici, TOUT est verifie sur l'objet ouvert, plus sur le chemin.
+  [[ -d $SD ]] || die "state path is not a directory: $STATE_DIR"
+  [[ -O $SD ]] || die "state directory is not owned by this user: $STATE_DIR"
+  chmod 700 "$SD" || die "cannot set mode 0700 on $STATE_DIR"
+
+  CLASS_FILE="$SD/window-class"
+  # L'adresse de la fenetre est portee par un NOM DE FICHIER, pas par un
+  # contenu : voir store_addr.
+  WINDOW_DIR="$SD/window"
+  mkdir -p "$WINDOW_DIR" || die "cannot create $STATE_DIR/window"
+
+  # Vestige des versions <= 1.1.0, ou l'adresse etait le CONTENU d'un fichier
+  # que le widget de barre lisait lui aussi. Le test est un builtin : le `rm`
+  # n'a lieu qu'une fois, a la premiere invocation apres la mise a jour.
+  [[ -e $SD/window-address || -L $SD/window-address ]] &&
+    rm -f "$SD/window-address" 2>/dev/null
+  return 0
 }
 
-# Lecture : fichier REGULIER, non symbolique, a nous — sinon on rend le vide.
-# Le script retombe alors sur le rattrapage par ligne de commande, qui, lui,
-# ne fait confiance a aucun fichier.
+# Lecture BORNEE et verifiee SUR LE DESCRIPTEUR.
+#
+#  - `<>` (O_RDWR) au lieu de `<` : un `<` sur un tube nomme BLOQUE jusqu'a ce
+#    qu'un ecrivain se presente, ce qui figerait le script (et le verrou).
+#    O_RDWR ne bloque pas, et ne tronque rien.
+#  - Les tests `-f` et `-O` portent sur `/dev/fd/N`, donc sur l'objet REELLEMENT
+#    ouvert : un echange de nom entre le test et la lecture n'a plus de prise.
+#    Un peripherique, un repertoire ou un tube sont ecartes ici.
+#  - `read -N 256` borne les OCTETS : un fichier gonfle est tronque, pas charge.
 read_state_file() {
-  local f="$1" v
-  [[ -f $f && ! -L $f && -O $f ]] || return 0
-  v=$(< "$f") || return 0
+  local f="$1" fd v=""
+  [[ -e $f ]] || return 0
+  exec {fd}<>"$f" 2>/dev/null || return 0
+  if [[ -f /dev/fd/$fd && -O /dev/fd/$fd ]]; then
+    IFS= read -r -N 256 -u "$fd" v 2>/dev/null || true
+  fi
+  exec {fd}<&-
   printf '%s' "${v%%$'\n'*}"
 }
 
-# Ecriture ATOMIQUE : temporaire dans le meme repertoire, puis `mv`. Le
-# `rename(2)` REMPLACE la cible quelle qu'elle soit — un lien symbolique
-# depose entre-temps est ecrase, pas suivi. Une redirection `>` l'aurait suivi
-# et aurait tronque le fichier vise.
+# Ecriture ATOMIQUE : temporaire dans le meme repertoire (via le descripteur),
+# puis `mv`. Le `rename(2)` REMPLACE la cible quelle qu'elle soit — un lien
+# symbolique depose entre-temps est ecrase, pas suivi. Une redirection `>`
+# l'aurait suivi et aurait tronque le fichier vise.
 write_state_file() {
   local f="$1" v="$2" tmp
-  tmp=$(mktemp "$STATE_DIR/.tmp.XXXXXX") || return 1
-  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  tmp=$(mktemp "$SD/.tmp.XXXXXX") || return 1
   printf '%s' "$v" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+}
+
+# L'ADRESSE DE LA FENETRE EST UN NOM DE FICHIER, PAS UN CONTENU.
+#
+# Le widget de barre la lit lui aussi, et il n'a aucun moyen de borner ce qu'il
+# lit : `FileView` (Quickshell) n'expose aucun plafond de taille — verifie dans
+# sa source. Un fichier d'etat demesure, ou un tube nomme depose a sa place,
+# etait donc lu integralement, ou bloquant, DANS LE PROCESSUS DE LA BARRE.
+#
+# `$STATE_DIR/window/` contient donc au plus une entree VIDE, dont le NOM est
+# l'adresse. Le widget la lit avec un FolderListModel : il ne lit plus aucun
+# contenu, et la longueur d'un nom est bornee par le systeme de fichiers.
+store_addr() {
+  local a="$1" f tmp
+  valid_addr "$a" || return 1
+  for f in "$WINDOW_DIR"/*; do
+    [[ -e $f || -L $f ]] || continue
+    [[ ${f##*/} == "$a" ]] || rm -f -- "$f"
+  done
+  [[ -f $WINDOW_DIR/$a && ! -L $WINDOW_DIR/$a ]] && return 0
+  # `mv` plutot que `> fichier` : `>` suivrait un lien symbolique depose la.
+  tmp=$(mktemp "$WINDOW_DIR/.tmp.XXXXXX") || return 1
+  mv -f "$tmp" "$WINDOW_DIR/$a" || { rm -f "$tmp"; return 1; }
+}
+
+clear_addr() {
+  local f
+  for f in "$WINDOW_DIR"/*; do
+    [[ -e $f || -L $f ]] || continue
+    rm -f -- "$f"
+  done
 }
 
 init_state_dir
@@ -243,11 +367,17 @@ LUA_CLICK_CMD=$(lua_str "$(sh_word "$SELF") click")
 #
 # `exec 9>` SUIT un lien symbolique. Le repertoire est verifie plus haut, mais
 # un fichier `lock` deja detourne y survivrait : on le remet a plat.
-LOCK_FILE="$STATE_DIR/lock"
+LOCK_FILE="$SD/lock"
 if [[ -L $LOCK_FILE || (-e $LOCK_FILE && ! -f $LOCK_FILE) ]]; then
-  rm -f "$LOCK_FILE" || die "cannot reset the lock file: $LOCK_FILE"
+  rm -f "$LOCK_FILE" || die "cannot reset the lock file: $STATE_DIR/lock"
 fi
-exec 9>"$LOCK_FILE"
+# `9>>` et non `9>` : l'ouverture ne doit RIEN tronquer. Si le nom venait a
+# designer autre chose entre le controle et l'ouverture, `9>` aurait vide le
+# fichier vise avant meme qu'on puisse le constater. `flock` n'a pas besoin
+# d'ecrire.
+exec 9>>"$LOCK_FILE"
+# Controle sur l'objet REELLEMENT ouvert.
+[[ -f /dev/fd/9 && -O /dev/fd/9 ]] || die "the lock file is not a regular file we own"
 flock -w 3 9 || exit 0
 
 # --- navigateur -------------------------------------------------------------
@@ -298,18 +428,28 @@ stored_class() {
 # ce qui colle les arguments entre eux — sans consequence pour un test de
 # sous-chaine.
 owns_window() {
-  local pid="$1" cmd
+  local pid="$1" cmd=""
   # Le PID compose un chemin sous /proc : il doit etre un nombre, sinon un
   # « .. » en ferait une lecture ailleurs.
   [[ $pid =~ ^[1-9][0-9]{0,9}$ && -r /proc/$pid/cmdline ]] || return 1
-  # Les avertissements « octet nul ignore » de bash sont attendus et sans
-  # consequence ici : on les tait plutot que de lancer un `tr`.
-  { cmd=$(< "/proc/$pid/cmdline"); } 2>/dev/null || return 1
+  # Lecture BORNEE : la ligne de commande d'un processus est choisie par ce
+  # processus, donc sa taille n'est bornee par rien d'utile ici. `read -N`
+  # s'arrete a 64 Kio — largement au-dela de la ligne de Chromium, dont le
+  # drapeau qui nous interesse est en tete. Les avertissements « octet nul
+  # ignore » de bash sont attendus et sans consequence pour un test de
+  # sous-chaine ; on les tait plutot que de lancer un `tr`.
+  { IFS= read -r -N 65536 cmd < "/proc/$pid/cmdline"; } 2>/dev/null || true
   [[ $cmd == *"--user-data-dir=$PROFILE_DIR"* ]]
 }
+# L'adresse est le NOM d'une entree de $WINDOW_DIR : aucun contenu n'est lu, et
+# la longueur est bornee par le systeme de fichiers.
 stored_addr() {
-  local v; v=$(read_state_file "$ADDR_FILE")
-  if [[ -n $v ]] && valid_addr "$v"; then printf '%s' "$v"; fi
+  local f a
+  for f in "$WINDOW_DIR"/0x*; do
+    a=${f##*/}
+    if [[ -f $f && ! -L $f ]] && valid_addr "$a"; then printf '%s' "$a"; return 0; fi
+  done
+  return 0
 }
 
 # --- lecture d'etat ---------------------------------------------------------
@@ -408,7 +548,7 @@ mon_y=""; off_x=""
 
 read_state() {
   local ref="${1:-window}" line
-  line=$(hy -j --batch 'clients;monitors' | jq -s -r \
+  line=$(hypr_json --batch 'clients;monitors' | jq -s -r \
     --arg addr "$(stored_addr)" --arg cls "$(stored_class)" \
     --arg special "$SPECIAL" --arg pos "$position" --arg ref "$ref" \
     --argjson w "$width" --argjson h "$height" \
@@ -466,12 +606,12 @@ read_state() {
     local found
     if found=$(recover_window); then
       local found_cls
-      found_cls=$(hy clients -j | jq -r --arg a "$found" \
+      found_cls=$(hypr_json clients | jq -r --arg a "$found" \
         'map(select(.address == $a)) | first | .class // ""')
       # Remplacement atomique, jamais une redirection : `>` suivrait un lien
       # symbolique depose a la place du fichier d'etat. Et pas de saut de
       # ligne final, qui ferait echouer toutes les comparaisons de classe.
-      write_state_file "$ADDR_FILE" "$found" || true
+      store_addr "$found" || true
       write_state_file "$CLASS_FILE" "$found_cls" || true
       read_state "$ref" recovered
       return 0
@@ -480,7 +620,7 @@ read_state() {
 
   # L'adresse retrouvee par la classe peut differer de celle memorisee : on la
   # reecrit, c'est elle que le widget de barre lit pour connaitre l'etat reel.
-  [[ -n $addr && $addr != "$(stored_addr)" ]] && write_state_file "$ADDR_FILE" "$addr"
+  [[ -n $addr && $addr != "$(stored_addr)" ]] && store_addr "$addr"
   return 0
 }
 
@@ -536,7 +676,7 @@ click_outside() {
   if [[ -n ${HA_CLICK_AT:-} ]]; then
     read -r cx cy <<<"$HA_CLICK_AT"
   else
-    read -r cx cy < <(hy cursorpos -j | jq -r '"\(.x) \(.y)"')
+    read -r cx cy < <(hypr_json cursorpos | jq -r '"\(.x) \(.y)"')
   fi
   # La position du pointeur alimente une comparaison arithmetique et deux
   # `--argjson` : elle est verifiee, y compris quand elle vient du crochet de
@@ -550,7 +690,7 @@ click_outside() {
   # l'affaire du widget, pas la notre. Sans ca, cliquer sur l'icone declenchait
   # a la fois ce masquage et le `toggle` du widget, qui rouvrait aussitot.
   local in_bar
-  in_bar=$(hy monitors -j | jq -r --argjson x "$cx" --argjson y "$cy" '
+  in_bar=$(hypr_json monitors | jq -r --argjson x "$cx" --argjson y "$cy" '
     map(select($x >= .x and $x < .x + .width and $y >= .y and $y < .y + .height))
     | first
     | if . == null then "non"
@@ -589,7 +729,7 @@ recover_window() {
   while IFS=: read -r a p; do
     valid_addr "$a" || continue
     if owns_window "$p"; then printf '%s' "$a"; return 0; fi
-  done < <(hy clients -j | jq -r '
+  done < <(hypr_json clients | jq -r '
     .[] | select(.class // "" | startswith("chrome")) | "\(.address):\(.pid)"')
   return 1
 }
@@ -605,7 +745,7 @@ close_special() {
   # anterieure : `toggle_special` est une bascule, et refermer sur un etat
   # perime ROUVRE la reserve au lieu de la fermer.
   local mon
-  mon=$(hy monitors -j | jq -r --arg n "special:$SPECIAL" \
+  mon=$(hypr_json monitors | jq -r --arg n "special:$SPECIAL" \
     'map(select(.specialWorkspace.name == $n)) | first | .name // ""')
   [[ -n $mon ]] || return 0
   valid_mon "$mon" || { echo "unexpected monitor name: '$mon'" >&2; return 1; }
@@ -617,7 +757,7 @@ close_special() {
     >/dev/null 2>&1
 
   local still
-  still=$(hy monitors -j | jq -r --arg n "special:$SPECIAL" \
+  still=$(hypr_json monitors | jq -r --arg n "special:$SPECIAL" \
     '[.[] | select(.specialWorkspace.name == $n)] | length')
   [[ $still == 0 ]] || { echo "the reserve stayed open on a monitor" >&2; return 1; }
 }
@@ -641,7 +781,7 @@ focus_window() {
 
   hy dispatch "hl.dsp.focus({ window = $(lua_str "address:$target") })" >/dev/null 2>&1
 
-  active=$(hy activewindow -j | jq -r '.address // ""')
+  active=$(hypr_json activewindow | jq -r '.address // ""')
   [[ $active == "$target" ]] || {
     echo "focus not acquired (target $target, active ${active:-none})" >&2
     return 1
@@ -668,7 +808,7 @@ focus_window() {
 # et 78 ms de CPU avec /usr/bin/sleep.
 SLEEP_FD=""
 open_snooze() {
-  local f="$STATE_DIR/tick.$$"
+  local f="$SD/tick.$$"
   mkfifo -m 600 "$f" 2>/dev/null || return 1
   exec {SLEEP_FD}<>"$f"
   rm -f "$f"
@@ -722,7 +862,7 @@ ensure_no_anim() {
 
   local sig="${HYPRLAND_INSTANCE_SIGNATURE:-unknown}"
   [[ $sig =~ ^[A-Za-z0-9_-]{1,128}$ ]] || sig="unknown"
-  local mark="$STATE_DIR/noanim.$sig"
+  local mark="$SD/noanim.$sig"
   [[ -f $mark && ! -L $mark ]] && return 0
 
   hy eval "hl.window_rule({ match = { class = $(lua_str "$cls") }, no_anim = true })" \
@@ -832,7 +972,7 @@ launch() {
   bin=$(resolve_browser) || exit 1
   [[ -n $url ]] || { echo "no URL configured" >&2; exit 1; }
 
-  before=$(hy clients -j | jq -r '[.[].address] | join(" ")')
+  before=$(hypr_json clients | jq -r '[.[].address] | join(" ")')
 
   args=(--app="$url" --no-first-run --no-default-browser-check
         --disable-session-crashed-bubble --hide-crash-restore-bubble --noerrdialogs)
@@ -844,14 +984,14 @@ launch() {
   # navigateur HERITE du fd 9 et garde le flock pour toute sa duree de vie.
   # Toutes les invocations suivantes (toggle, hide, click) expiraient alors
   # sur `flock -w 3` et sortaient en silence — le plugin devenait inerte.
-  setsid "$bin" "${args[@]}" >/dev/null 2>&1 < /dev/null 9>&- &
+  setsid "$bin" "${args[@]}" >/dev/null 2>&1 < /dev/null 9>&- {STATE_FD}>&- &
   disown
 
   # Chromium peut mettre plusieurs secondes a mapper sa fenetre : demarrage a
   # froid du profil, initialisation GPU. 60 s de patience, sinon un premier
   # lancement lent passerait pour un echec.
   for _ in $(seq 1 240); do
-    new_addr=$(hy clients -j | jq -r --arg before "$before" '
+    new_addr=$(hypr_json clients | jq -r --arg before "$before" '
       ($before | split(" ")) as $seen
       | map(select((.address as $a | $seen | index($a) | not)
                    and (.class // "" | startswith("chrome"))))
@@ -866,12 +1006,14 @@ launch() {
     return 1
   }
 
-  cls=$(hy clients -j | jq -r --arg a "$new_addr" '
+  cls=$(hypr_json clients | jq -r --arg a "$new_addr" '
     map(select(.address == $a)) | first | .class // ""')
   valid_class "$cls" || { echo "the window class is not usable: '$cls'" >&2; return 1; }
   write_state_file "$CLASS_FILE" "$cls" || return 1
-  write_state_file "$ADDR_FILE" "$new_addr" || return 1
-  rm -f "$STATE_DIR"/noanim.* 2>/dev/null || true
+  store_addr "$new_addr" || return 1
+  # Vestige des versions <= 1.1.0, ou l'adresse etait un CONTENU de fichier.
+  rm -f "$SD/window-address" 2>/dev/null || true
+  rm -f "$SD"/noanim.* 2>/dev/null || true
   ensure_no_anim
 
   # Geometrie posee ici une fois pour toutes, puis la fenetre part en reserve.
@@ -1004,7 +1146,7 @@ prewarm)
   # Le prechauffage RE-ARME la regle `no_anim` : c'est le seul point de
   # recuperation apres un `hyprctl reload`, qui efface les regles de fenetre
   # sans changer la signature d'instance. En pratique : `omarchy restart shell`.
-  rm -f "$STATE_DIR"/noanim.* 2>/dev/null || true
+  rm -f "$SD"/noanim.* 2>/dev/null || true
   read_state window
   [[ $vis != absente ]] || launch || exit 1
   ensure_no_anim
@@ -1026,7 +1168,8 @@ quit)
   [[ -n $addr ]] && valid_addr "$addr" &&
     hy dispatch "hl.dsp.window.close({ window = $(lua_str "address:$addr") })" >/dev/null 2>&1
   disarm_click
-  rm -f "$CLASS_FILE" "$ADDR_FILE" "$STATE_DIR"/noanim.*
+  clear_addr
+  rm -f "$CLASS_FILE" "$SD/window-address" "$SD"/noanim.*
   ;;
 status)
   read_state window
