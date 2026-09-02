@@ -51,6 +51,7 @@ PROFILE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-homeassistant"
 # par le DESCRIPTEUR du repertoire d'etat, pas par son nom (voir plus bas).
 SD=""
 CLASS_FILE=""
+CLICK_MARK=""
 
 url=""
 width=480
@@ -242,14 +243,35 @@ init_state_dir() {
   mkdir -p "${STATE_DIR%/*}" 2>/dev/null || true
   mkdir "$STATE_DIR" 2>/dev/null || true
 
-  # Garde-fou de VIVACITE, pas de securite : un `<` sur un TUBE NOMME bloque
-  # jusqu'a ce qu'un ecrivain se presente, et un repertoire ne peut pas s'ouvrir
-  # en O_RDWR pour l'eviter. Ce test ecarte le cas depose a l'avance ; s'il est
-  # gagne a la course, on ouvre autre chose qu'un repertoire, et le controle
-  # d'inode ci-dessous refuse. La securite ne repose donc jamais sur ce test.
-  [[ -e $STATE_DIR && ! -d $STATE_DIR ]] && die "state path is not a directory: $STATE_DIR"
-
-  exec {STATE_FD}<"$STATE_DIR" || die "cannot open the state directory: $STATE_DIR"
+  # ACQUISITION PAR `chdir`, ET NON PAR UNE OUVERTURE DU CHEMIN.
+  #
+  # Un `exec {fd}<"$chemin"` est un `open(O_RDONLY)`. Sur un TUBE NOMME, cet
+  # appel BLOQUE jusqu'a ce qu'un ecrivain se presente : aucun controle pose
+  # apres l'ouverture n'est jamais atteint. Un test `[[ -d ]]` prealable
+  # n'ecarte que le cas depose a l'avance — un echange gagne a la course fige
+  # le script, verrou en main. Un repertoire ne peut pas s'ouvrir en `O_RDWR`
+  # (EISDIR), donc l'astuce utilisee pour les fichiers d'etat ne s'applique pas
+  # ici. Et bash n'expose pas `O_DIRECTORY|O_NOFOLLOW`.
+  #
+  # `chdir(2)`, lui, echoue en ENOTDIR sur tout ce qui n'est pas un repertoire,
+  # IMMEDIATEMENT et sans jamais bloquer — un tube nomme est ecarte par l'appel
+  # lui-meme, pas par un controle qui le precede. Une fois dedans, `.` designe
+  # l'inode ou l'on se trouve : l'ouvrir ne resout aucun nom, ne suit aucun
+  # lien et ne peut pas bloquer.
+  #
+  # Le type est donc impose ATOMIQUEMENT par l'acquisition, et le lien
+  # symbolique reste ecarte par la comparaison d'inode ci-dessous. Verifie :
+  # `cd` sur un tube nomme rend la main aussitot (« N'est pas un dossier »),
+  # la ou `sed` sur le meme tube reste suspendu indefiniment.
+  #
+  # Le repertoire de travail est restaure aussitot : il est herite par le
+  # navigateur lance plus loin.
+  local oldpwd=$PWD
+  CDPATH= cd -P -- "$STATE_DIR" 2>/dev/null ||
+    die "state path is not a directory we can enter: $STATE_DIR"
+  exec {STATE_FD}<. || die "cannot open the state directory: $STATE_DIR"
+  CDPATH= cd -P -- "$oldpwd" 2>/dev/null || cd / ||
+    die "cannot restore the working directory"
   SD="/dev/fd/$STATE_FD"
 
   # A partir d'ici, TOUT est verifie sur l'objet ouvert, plus sur le chemin.
@@ -268,8 +290,9 @@ init_state_dir() {
   #  - un parent legitimement symbolique (p. ex. ~/.local/state deplace) reste
   #    accepte, puisque lstat suit les parents. Verifie sur les deux cas.
   #
-  # bash n'a pas d'`openat(..., O_NOFOLLOW)` : la detection est en echec
-  # FERME — on refuse de travailler — pas une impossibilite d'ouvrir.
+  # bash n'a pas d'`openat(..., O_NOFOLLOW)` : pour le LIEN SYMBOLIQUE la
+  # detection est en echec FERME — on refuse de travailler — la ou le type,
+  # lui, est impose par le `chdir` ci-dessus.
   local held named
   held=$(stat -L -c '%d:%i' "$SD" 2>/dev/null) || die "cannot stat the state directory descriptor"
   named=$(stat -c '%d:%i' -- "$STATE_DIR" 2>/dev/null) || die "cannot stat the state path: $STATE_DIR"
@@ -279,6 +302,8 @@ init_state_dir() {
   chmod 700 "$SD" || die "cannot set mode 0700 on $STATE_DIR"
 
   CLASS_FILE="$SD/window-class"
+  # Preuve de propriete du bind souris global : voir arm_click.
+  CLICK_MARK="$SD/click-armed"
 
   # Vestiges des versions precedentes, tous effaces a travers le descripteur.
   # Les tests sont des builtins : le `rm` n'a lieu qu'une fois, a la premiere
@@ -428,31 +453,95 @@ flock -w 3 9 || exit 0
 # Seule la famille Chromium sait ouvrir une fenetre sans interface (--app).
 # Firefox et Zen ne le peuvent pas : on retombe alors sur chromium, present
 # dans omarchy-base.packages, donc sur toute installation Omarchy.
+# CE QUE LE BUREAU NOUS DIT EST UN INDICE, PAS UNE ADRESSE.
+#
+# La decouverte du navigateur par defaut finit par EXECUTER ce qu'elle a
+# trouve. Trois choses devaient donc changer :
+#
+#  1. le fichier `.desktop` etait lu par `sed` sans plafond — et `sed` sur un
+#     TUBE NOMME reste suspendu indefiniment (verifie, rc=124 sous `timeout`).
+#     Il est desormais lu par DESCRIPTEUR, en `<>` (O_RDWR ne bloque pas sur un
+#     tube), controle `-f` sur l'objet REELLEMENT ouvert, et borne a 64 Kio ;
+#  2. la ligne `Exec=` pouvait designer un CHEMIN. On n'en garde que le nom de
+#     base : le fichier `.desktop` peut nommer un navigateur, jamais indiquer
+#     ou le prendre ;
+#  3. ce nom etait resolu sur le PATH AMBIANT, donc potentiellement sur un
+#     repertoire que l'utilisateur peut ecrire. La resolution se fait
+#     maintenant sur un PATH FIGE, et le resultat doit etre un executable
+#     regulier appartenant a root.
+#
+# La meme resolution s'applique au nom venu des reglages et aux candidats de
+# repli : aucun chemin d'execution n'echappe a `trusted_bin`.
+TRUSTED_PATH=/usr/local/bin:/usr/bin:/bin
+
+trusted_bin() {
+  local name="$1" p
+  # Un NOM, jamais un chemin : ni « / », ni « .. ».
+  [[ ${#name} -le 64 && $name =~ ^[A-Za-z0-9._+-]+$ ]] || return 1
+  p=$(PATH="$TRUSTED_PATH" command -v -- "$name" 2>/dev/null) || return 1
+  [[ $p == /* && -f $p && -x $p ]] || return 1
+  # Un binaire que nous pourrions reecrire ne prouve rien.
+  [[ $(stat -L -c %u -- "$p" 2>/dev/null) == 0 ]] || return 1
+  printf '%s' "$p"
+}
+
+# Nom de base de la premiere ligne `Exec=` d'un fichier `.desktop`, lu de facon
+# bornee et par descripteur. Provenance limitee aux trois emplacements
+# standards ; le nom lui-meme est ensuite passe a `trusted_bin`.
+desktop_exec_name() {
+  local d="$1" dir f fd v="" line
+  for dir in "$HOME/.local/share/applications" "$HOME/.nix-profile/share/applications" \
+             /usr/share/applications; do
+    f="$dir/$d"
+    [[ -e $f ]] || continue
+    # Accolades : voir `read_state_file`. Sans elles, la stderr du script
+    # entier partirait a /dev/null.
+    { exec {fd}<>"$f"; } 2>/dev/null || continue
+    v=""
+    # `-f` sur le descripteur tenu : un tube, un peripherique ou un repertoire
+    # sont ecartes ici, apres une ouverture qui, elle, n'a pas pu bloquer.
+    if [[ -f /dev/fd/$fd ]]; then
+      IFS= read -r -N 65536 -u "$fd" v 2>/dev/null || true
+    fi
+    exec {fd}<&-
+    [[ -n $v ]] || continue
+    while IFS= read -r line; do
+      [[ $line == Exec=* ]] || continue
+      line=${line#Exec=}
+      line=${line%% *}
+      printf '%s' "${line##*/}"
+      return 0
+    done <<<"$v"
+  done
+  return 1
+}
+
 resolve_browser() {
-  if [[ -n $browser ]] && command -v "$browser" >/dev/null 2>&1; then
-    command -v "$browser"; return 0
+  local p desktop name
+  if [[ -n $browser ]]; then
+    if p=$(trusted_bin "$browser"); then printf '%s' "$p"; return 0; fi
+    echo "the requested browser is not a trusted executable: '$browser'" >&2
+    return 1
   fi
 
-  local desktop exec_bin
   # Bornees : `xdg-settings` interroge le bureau et peut rester suspendu si le
   # portail ne repond pas, ce qui figerait le verrou d'invocation.
   desktop=$(timeout 5 env -u BROWSER xdg-settings get default-web-browser 2>/dev/null || true)
   [[ -z $desktop ]] && desktop=$(timeout 5 xdg-mime query default x-scheme-handler/https 2>/dev/null || true)
   # Un nom de fichier .desktop, pas un chemin : ni « / », ni « .. ».
-  [[ $desktop =~ ^[A-Za-z0-9._+-]{1,255}\.desktop$ ]] || desktop=""
+  [[ ${#desktop} -le 255 && $desktop =~ ^[A-Za-z0-9._+-]+\.desktop$ ]] || desktop=""
 
-  if [[ -n $desktop ]]; then
-    exec_bin=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' \
-      {"$HOME"/.local,"$HOME"/.nix-profile,/usr}/share/applications/"$desktop" 2>/dev/null | head -1)
-    if [[ -n $exec_bin ]] && command -v "$exec_bin" >/dev/null 2>&1 &&
-       timeout 5 "$exec_bin" --help 2>/dev/null | grep -q -- "--app"; then
-      command -v "$exec_bin"; return 0
+  if [[ -n $desktop ]] && name=$(desktop_exec_name "$desktop") && p=$(trusted_bin "$name"); then
+    # La sonde EXECUTE le binaire : elle vient apres `trusted_bin`, jamais
+    # avant, et sa sortie est bornee en octets comme en temps.
+    if timeout 5 "$p" --help 2>/dev/null | head -c 65536 | grep -q -- "--app"; then
+      printf '%s' "$p"; return 0
     fi
   fi
 
   local candidate
   for candidate in chromium google-chrome-stable google-chrome brave microsoft-edge-stable; do
-    if command -v "$candidate" >/dev/null 2>&1; then command -v "$candidate"; return 0; fi
+    if p=$(trusted_bin "$candidate"); then printf '%s' "$p"; return 0; fi
   done
 
   echo "no --app capable browser found (chromium required)" >&2
@@ -685,26 +774,77 @@ read_state() {
 # `non_consuming` est le SEUL nom d'option qui marche. `nonconsuming` et
 # `flags = "n"` sont acceptes par hyprctl (« ok ») mais silencieusement
 # IGNORES — verifie avec `hyprctl binds -j`.
+# LE BIND EST GLOBAL ET NE NOUS APPARTIENT PAS D'OFFICE.
+#
+# `hl.unbind` ne retire que les binds SANS modificateur : le « Move window »
+# d'Omarchy (SUPER + mouse:272, modmask 64) est preserve. Verifie. Mais il les
+# retire TOUS, pas le notre — mesure faite : deux binds poses, un seul unbind,
+# compte a zero. Un utilisateur ayant son propre clic gauche nu le perdait donc
+# a la fermeture de la vue.
+#
+# Et on ne peut pas le remettre : `hyprctl binds -j` rend un bind Lua sous la
+# forme `dispatcher: "__lua", arg: "284"` — un IDENTIFIANT DE CALLBACK opaque.
+# La commande liee n'est pas recuperable, donc « sauvegarder puis restaurer »
+# est impossible, pas seulement delicat.
+#
+# D'ou une preuve de propriete explicite :
+#
+#  - on ne pose le bind que si AUCUN `mouse:272` sans modificateur n'existe
+#    deja — sauf s'il est a nous, le marqueur en fait foi ;
+#  - on ne le retire que si le marqueur est present ET qu'il n'y en a
+#    exactement qu'un : celui qu'on a pose.
+#
+# Le marqueur est un FICHIER D'ETAT, pas une variable : `disarm_click` est
+# appele par d'autres invocations que celle qui a arme.
+#
+# Consequence assumee : si l'utilisateur a deja un `mouse:272` nu, la fermeture
+# au clic ailleurs ne s'active pas. Le clic sur l'icone continue de basculer la
+# vue, et un diagnostic est emis.
+click_binds() {
+  local n
+  n=$(hypr_json binds 2>/dev/null |
+      jq --arg k "$CLICK_BUTTON" '[.[] | select(.key == $k and .modmask == 0)] | length') || return 1
+  valid_num "$n" || return 1
+  printf '%s' "$n"
+}
+click_owned() { [[ -f $CLICK_MARK && ! -L $CLICK_MARK ]]; }
+
 arm_click() {
   ((click_dismiss)) || return 0
-  # `hl.bind` ne remplace pas : il EMPILE. Deux `show` d'affilee posaient
-  # deux binds, et un seul clic lancait alors deux `ha-window click`.
-  # Verifie avec `hyprctl binds -j` (le compte montait a 2, 3, ...).
-  disarm_click
+  local n; n=$(click_binds) || return 0
+  if ((n > 0)); then
+    click_owned || {
+      echo "mouse:272 is already bound by someone else, leaving it alone (click-outside dismissal stays off)" >&2
+      return 0
+    }
+    # `hl.bind` ne remplace pas : il EMPILE. Deux `show` d'affilee posaient
+    # deux binds, et un seul clic lancait alors deux `ha-window click`.
+    # Verifie avec `hyprctl binds -j` (le compte montait a 2, 3, ...).
+    disarm_click
+  fi
   # `$SELF` est verifie au demarrage (jeu de caracteres borne), puis mis entre
   # apostrophes pour /bin/sh et echappe pour Lua : le chemin d'installation ne
   # peut pas devenir de la syntaxe, dans aucune des deux couches.
   hy eval \
     "hl.bind($LUA_CLICK_BUTTON, hl.dsp.exec_cmd($LUA_CLICK_CMD), { non_consuming = true })" \
     >/dev/null 2>&1
+  write_state_file "$CLICK_MARK" "" || true
   click_armed=1
 }
 
-# `hl.unbind` ne retire que le bind SANS modificateur : le « Move window »
-# d'Omarchy (SUPER + mouse:272, modmask 64) est preserve. Verifie.
 disarm_click() {
-  hy eval "hl.unbind($LUA_CLICK_BUTTON)" >/dev/null 2>&1
   click_armed=0
+  # Pas de marqueur : le bind eventuellement present n'est pas le notre.
+  click_owned || return 0
+  local n; n=$(click_binds) || n=1
+  if ((n > 1)); then
+    echo "another mouse:272 binding appeared, leaving all of them alone" >&2
+    rm -f "$CLICK_MARK" 2>/dev/null
+    return 0
+  fi
+  hy eval "hl.unbind($LUA_CLICK_BUTTON)" >/dev/null 2>&1
+  rm -f "$CLICK_MARK" 2>/dev/null
+  return 0
 }
 
 click_outside() {
@@ -1182,8 +1322,10 @@ cleanup() {
   local rc=$?
   set +e
   if ((rc != 0)) && ((click_dismiss)); then
+    # `disarm_click` et non un `unbind` direct : le nettoyage ne retire que le
+    # bind DONT NOUS SOMMES PROPRIETAIRES.
     if ((click_armed)) || [[ $vis != visible ]]; then
-      hy eval "hl.unbind($LUA_CLICK_BUTTON)" >/dev/null 2>&1
+      disarm_click
     fi
   fi
   [[ -n $SLEEP_FD ]] && exec {SLEEP_FD}>&-

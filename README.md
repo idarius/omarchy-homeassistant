@@ -117,8 +117,12 @@ then opened once, and everything afterwards resolves through that descriptor
 It is the only directory the plugin ever opens: everything it touches is a
 direct entry of it, so no intermediate component is resolved by name. Acquiring
 it does not trust the name either — the last component is created with `mkdir`
-rather than `mkdir -p`, which never follows a symlink, and an existing directory
-is accepted only if the name still designates the very inode that was opened.
+rather than `mkdir -p`, which never follows a symlink; the directory is then
+entered with `chdir`, which fails immediately on anything that is not a
+directory instead of blocking the way opening a named pipe would, and the
+descriptor is taken on `.`, which resolves no name and follows no link. An
+existing directory is accepted only if the name still designates the very inode
+that was opened.
 Individual files are opened before being checked, and the checks are made on the
 descriptor actually held; reads are capped at 256 bytes, and writes go through
 an atomic rename, which replaces a symlink instead of following it.
@@ -129,6 +133,22 @@ file would have been read whole inside the bar process and a named pipe left in
 its place would have stalled it. The state directory therefore holds at most one
 empty entry whose name is the address (`0x…`); the widget lists names, filtered
 to `0x*`, and never reads content.
+
+**The global mouse binding is only ever removed if the plugin installed it.**
+Hyprland removes every binding for a key at once, and it reports a Lua binding
+as an opaque callback id, so a previous binding can be neither spared nor
+restored. The plugin therefore refuses to bind `mouse:272` when a bare one
+already exists — click-outside dismissal simply stays off, and the icon still
+toggles the view — and it removes its own only while a state marker proves the
+binding is its own and no other has appeared.
+
+**What the desktop tells us is a hint, not an address.** Discovering the
+default browser ends in executing what it found, so the `.desktop` entry is
+read through a descriptor and capped in bytes, only its `Exec` *basename* is
+kept — the file may name a browser, never say where to take it — and that name
+is resolved against a fixed `PATH` and must end at a regular executable owned
+by root. The same resolution applies to the browser named in the settings and
+to the built-in fallbacks.
 
 Timeouts bound time, not bytes, and the size of `hyprctl clients -j` is not
 bounded by anything — a window title is chosen by the application that owns it.
