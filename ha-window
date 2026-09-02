@@ -47,11 +47,10 @@ SPECIAL="homeassistant"
 CLICK_BUTTON="mouse:272"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/homeassistant"
 PROFILE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-homeassistant"
-# SD, CLASS_FILE et WINDOW_DIR sont poses par init_state_dir : ils passent tous
+# SD et CLASS_FILE sont poses par init_state_dir : ils passent tous les deux
 # par le DESCRIPTEUR du repertoire d'etat, pas par son nom (voir plus bas).
 SD=""
 CLASS_FILE=""
-WINDOW_DIR=""
 
 url=""
 width=480
@@ -221,23 +220,34 @@ umask 077
 # ses parents — peut etre remplace. La verification portait donc sur un objet
 # qui n'etait plus celui qu'on utilisait ensuite.
 #
-# Le repertoire est desormais OUVERT une fois pour toutes, et tout le reste
-# passe par son DESCRIPTEUR : `/dev/fd/$STATE_FD/nom` resout le nom RELATIVEMENT
-# a l'inode ouvert — c'est l'equivalent d'un `openat(dirfd, ...)`, que bash
-# n'expose pas autrement. Un echange du repertoire par son chemin, apres
-# l'ouverture, ne change plus rien a ce que le script lit et ecrit.
+# Le repertoire est OUVERT une fois pour toutes, et tout le reste passe par son
+# DESCRIPTEUR : `/dev/fd/$STATE_FD/nom` resout le nom RELATIVEMENT a l'inode
+# ouvert — c'est l'equivalent d'un `openat(dirfd, ...)`, que bash n'expose pas
+# autrement. Un echange du repertoire par son chemin, apres l'ouverture, ne
+# change plus rien a ce que le script lit et ecrit.
 #
 # Verifie : repertoire deplace puis recree avec un contenu piege, le fd continue
 # de voir l'original. mkdir, mktemp, mv, chmod et le globbing fonctionnent tous
 # a travers `/dev/fd/N`.
+#
+# C'EST LE SEUL REPERTOIRE QUE LE SCRIPT OUVRE. Tout ce qu'il manipule est une
+# entree DIRECTE de celui-ci : aucun composant intermediaire n'est resolu par
+# son nom, donc il n'y a pas de second repertoire a acquerir ni a verifier.
 STATE_FD=""
 init_state_dir() {
-  [[ -L $STATE_DIR ]] && die "state path is a symlink, refusing to use it: $STATE_DIR"
-  if [[ -e $STATE_DIR ]]; then
-    [[ -d $STATE_DIR ]] || die "state path is not a directory: $STATE_DIR"
-  else
-    mkdir -p "$STATE_DIR" || die "cannot create the state directory: $STATE_DIR"
-  fi
+  # `mkdir` SANS `-p` sur le dernier composant : contrairement a `mkdir -p`, il
+  # echoue toujours si le nom existe deja, LIEN SYMBOLIQUE COMPRIS (mkdir(2) ne
+  # suit jamais le dernier composant). Sur une installation neuve il n'y a donc
+  # rien a verifier : on a cree l'objet, on sait ce que c'est.
+  mkdir -p "${STATE_DIR%/*}" 2>/dev/null || true
+  mkdir "$STATE_DIR" 2>/dev/null || true
+
+  # Garde-fou de VIVACITE, pas de securite : un `<` sur un TUBE NOMME bloque
+  # jusqu'a ce qu'un ecrivain se presente, et un repertoire ne peut pas s'ouvrir
+  # en O_RDWR pour l'eviter. Ce test ecarte le cas depose a l'avance ; s'il est
+  # gagne a la course, on ouvre autre chose qu'un repertoire, et le controle
+  # d'inode ci-dessous refuse. La securite ne repose donc jamais sur ce test.
+  [[ -e $STATE_DIR && ! -d $STATE_DIR ]] && die "state path is not a directory: $STATE_DIR"
 
   exec {STATE_FD}<"$STATE_DIR" || die "cannot open the state directory: $STATE_DIR"
   SD="/dev/fd/$STATE_FD"
@@ -245,19 +255,44 @@ init_state_dir() {
   # A partir d'ici, TOUT est verifie sur l'objet ouvert, plus sur le chemin.
   [[ -d $SD ]] || die "state path is not a directory: $STATE_DIR"
   [[ -O $SD ]] || die "state directory is not owned by this user: $STATE_DIR"
+
+  # LA COURSE CONTROLE/OUVERTURE, FERMEE. Un `[[ -L ]]` avant l'ouverture ne
+  # prouve rien : le chemin peut devenir un lien juste apres, et les tests
+  # ci-dessus, poses sur le descripteur, passent tout aussi bien si on a ouvert
+  # A TRAVERS ce lien. On exige donc que le NOM designe exactement l'INODE
+  # TENU : `stat` sans `-L` sur le nom (lstat, qui ne dereference que le dernier
+  # composant) contre `stat -L` sur le descripteur.
+  #
+  #  - dernier composant = lien symbolique : l'inode du lien n'est jamais celui
+  #    du repertoire ouvert -> refus, quel que soit le moment de l'echange ;
+  #  - un parent legitimement symbolique (p. ex. ~/.local/state deplace) reste
+  #    accepte, puisque lstat suit les parents. Verifie sur les deux cas.
+  #
+  # bash n'a pas d'`openat(..., O_NOFOLLOW)` : la detection est en echec
+  # FERME — on refuse de travailler — pas une impossibilite d'ouvrir.
+  local held named
+  held=$(stat -L -c '%d:%i' "$SD" 2>/dev/null) || die "cannot stat the state directory descriptor"
+  named=$(stat -c '%d:%i' -- "$STATE_DIR" 2>/dev/null) || die "cannot stat the state path: $STATE_DIR"
+  [[ $held == "$named" ]] ||
+    die "state path does not name the directory that was opened, refusing to use it: $STATE_DIR"
+
   chmod 700 "$SD" || die "cannot set mode 0700 on $STATE_DIR"
 
   CLASS_FILE="$SD/window-class"
-  # L'adresse de la fenetre est portee par un NOM DE FICHIER, pas par un
-  # contenu : voir store_addr.
-  WINDOW_DIR="$SD/window"
-  mkdir -p "$WINDOW_DIR" || die "cannot create $STATE_DIR/window"
 
-  # Vestige des versions <= 1.1.0, ou l'adresse etait le CONTENU d'un fichier
-  # que le widget de barre lisait lui aussi. Le test est un builtin : le `rm`
-  # n'a lieu qu'une fois, a la premiere invocation apres la mise a jour.
+  # Vestiges des versions precedentes, tous effaces a travers le descripteur.
+  # Les tests sont des builtins : le `rm` n'a lieu qu'une fois, a la premiere
+  # invocation apres la mise a jour.
+  #  - <= 1.1.0 : l'adresse etait le CONTENU de `window-address`, que le widget
+  #    de barre lisait lui aussi, sans plafond ;
+  #  - 1.2.0 : elle etait le nom d'une entree du SOUS-REPERTOIRE `window/`, seul
+  #    composant que le script resolvait encore par son nom. `rm -rf` NE SUIT
+  #    PAS un lien symbolique donne en argument : si `window` en est un, seul le
+  #    lien est supprime et sa cible n'est pas touchee. Verifie.
   [[ -e $SD/window-address || -L $SD/window-address ]] &&
     rm -f "$SD/window-address" 2>/dev/null
+  [[ -e $SD/window || -L $SD/window ]] &&
+    rm -rf "$SD/window" 2>/dev/null
   return 0
 }
 
@@ -299,25 +334,34 @@ write_state_file() {
 # sa source. Un fichier d'etat demesure, ou un tube nomme depose a sa place,
 # etait donc lu integralement, ou bloquant, DANS LE PROCESSUS DE LA BARRE.
 #
-# `$STATE_DIR/window/` contient donc au plus une entree VIDE, dont le NOM est
-# l'adresse. Le widget la lit avec un FolderListModel : il ne lit plus aucun
-# contenu, et la longueur d'un nom est bornee par le systeme de fichiers.
+# Le repertoire d'etat contient donc au plus une entree VIDE dont le NOM est
+# l'adresse (`0x…`). Le widget la lit avec un FolderListModel filtre sur `0x*` :
+# il ne lit plus aucun contenu, et la longueur d'un nom est bornee par le
+# systeme de fichiers.
+#
+# En 1.2.0 ces entrees vivaient dans un SOUS-REPERTOIRE `window/`, cree par
+# `mkdir -p` — qui accepte un lien symbolique vers un repertoire existant. Le
+# glob et le `rm` ci-dessous parcouraient alors la cible du lien. Tenir le
+# descripteur du PARENT n'y changeait rien : `window` restait resolu par son
+# nom. Le sous-repertoire est supprime : il n'apportait rien que le prefixe
+# `0x` ne donne, et sa disparition supprime le seul composant que le script ne
+# pouvait pas verifier.
 store_addr() {
   local a="$1" f tmp
   valid_addr "$a" || return 1
-  for f in "$WINDOW_DIR"/*; do
+  for f in "$SD"/0x*; do
     [[ -e $f || -L $f ]] || continue
     [[ ${f##*/} == "$a" ]] || rm -f -- "$f"
   done
-  [[ -f $WINDOW_DIR/$a && ! -L $WINDOW_DIR/$a ]] && return 0
+  [[ -f $SD/$a && ! -L $SD/$a ]] && return 0
   # `mv` plutot que `> fichier` : `>` suivrait un lien symbolique depose la.
-  tmp=$(mktemp "$WINDOW_DIR/.tmp.XXXXXX") || return 1
-  mv -f "$tmp" "$WINDOW_DIR/$a" || { rm -f "$tmp"; return 1; }
+  tmp=$(mktemp "$SD/.tmp.XXXXXX") || return 1
+  mv -f "$tmp" "$SD/$a" || { rm -f "$tmp"; return 1; }
 }
 
 clear_addr() {
   local f
-  for f in "$WINDOW_DIR"/*; do
+  for f in "$SD"/0x*; do
     [[ -e $f || -L $f ]] || continue
     rm -f -- "$f"
   done
@@ -441,11 +485,11 @@ owns_window() {
   { IFS= read -r -N 65536 cmd < "/proc/$pid/cmdline"; } 2>/dev/null || true
   [[ $cmd == *"--user-data-dir=$PROFILE_DIR"* ]]
 }
-# L'adresse est le NOM d'une entree de $WINDOW_DIR : aucun contenu n'est lu, et
-# la longueur est bornee par le systeme de fichiers.
+# L'adresse est le NOM d'une entree du repertoire d'etat : aucun contenu n'est lu,
+# et la longueur est bornee par le systeme de fichiers.
 stored_addr() {
   local f a
-  for f in "$WINDOW_DIR"/0x*; do
+  for f in "$SD"/0x*; do
     a=${f##*/}
     if [[ -f $f && ! -L $f ]] && valid_addr "$a"; then printf '%s' "$a"; return 0; fi
   done

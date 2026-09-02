@@ -114,6 +114,11 @@ only true for the instant it is made: the directory, or any of its parents, can
 be replaced between the check and the use. So the state directory is verified,
 then opened once, and everything afterwards resolves through that descriptor
 (`/dev/fd/N/…`, the equivalent of `openat`), which no later rename can redirect.
+It is the only directory the plugin ever opens: everything it touches is a
+direct entry of it, so no intermediate component is resolved by name. Acquiring
+it does not trust the name either — the last component is created with `mkdir`
+rather than `mkdir -p`, which never follows a symlink, and an existing directory
+is accepted only if the name still designates the very inode that was opened.
 Individual files are opened before being checked, and the checks are made on the
 descriptor actually held; reads are capped at 256 bytes, and writes go through
 an atomic rename, which replaces a symlink instead of following it.
@@ -121,9 +126,9 @@ an atomic rename, which replaces a symlink instead of following it.
 **The window address is a file name, not a file content.** The bar widget needs
 it too, and Quickshell's `FileView` offers no size cap, so an oversized state
 file would have been read whole inside the bar process and a named pipe left in
-its place would have stalled it. `<state>/window/` therefore holds at most one
-empty entry whose name is the address; the widget lists names and never reads
-content.
+its place would have stalled it. The state directory therefore holds at most one
+empty entry whose name is the address (`0x…`); the widget lists names, filtered
+to `0x*`, and never reads content.
 
 Timeouts bound time, not bytes, and the size of `hyprctl clients -j` is not
 bounded by anything — a window title is chosen by the application that owns it.

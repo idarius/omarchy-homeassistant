@@ -121,12 +121,18 @@ BarWidget {
   // Le widget etait ainsi un second lecteur du meme etat, independant des
   // controles du script et non borne.
   //
-  // `ha-window` maintient donc `<etat>/window/`, qui contient au plus UNE entree
-  // VIDE dont le NOM est l'adresse. On ne lit plus que des noms — bornes par le
-  // systeme de fichiers — et jamais un contenu.
+  // Le repertoire d'etat contient donc au plus UNE entree VIDE dont le NOM est
+  // l'adresse (`0x…`). On ne lit plus que des noms — bornes par le systeme de
+  // fichiers — et jamais un contenu.
+  //
+  // L'entree est a la RACINE de l'etat, pas dans un sous-repertoire `window/`
+  // comme en 1.2.0 : ce sous-repertoire etait le seul composant que `ha-window`
+  // resolvait encore par son nom, donc le seul qu'il ne pouvait pas verifier.
+  // `nameFilters` fait le tri, et le widget ne voit ni `lock`, ni
+  // `window-class`, ni les marqueurs internes du script.
   FolderListModel {
     id: windowDir
-    folder: "file://" + root.stateDir + "/window"
+    folder: "file://" + root.stateDir
     showDirs: false
     showHidden: false
     nameFilters: ["0x*"]

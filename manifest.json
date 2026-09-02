@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.idarius.homeassistant",
   "name": "Home Assistant",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "idarius",
   "license": "MIT",
   "description": "Slide-in Home Assistant dashboard from the Omarchy bar: left-click to show or hide it, right-click to configure it.",
