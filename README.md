@@ -134,13 +134,18 @@ its place would have stalled it. The state directory therefore holds at most one
 empty entry whose name is the address (`0x…`); the widget lists names, filtered
 to `0x*`, and never reads content.
 
-**The global mouse binding is only ever removed if the plugin installed it.**
+**The global mouse binding proves its ownership from the compositor itself.**
 Hyprland removes every binding for a key at once, and it reports a Lua binding
 as an opaque callback id, so a previous binding can be neither spared nor
-restored. The plugin therefore refuses to bind `mouse:272` when a bare one
-already exists — click-outside dismissal simply stays off, and the icon still
-toggles the view — and it removes its own only while a state marker proves the
-binding is its own and no other has appeared.
+restored — and a file next to it cannot prove anything about a runtime object,
+since a reload wipes the binding while the file survives. The binding therefore
+carries a description, which `hyprctl binds -j` reports back: the plugin
+installs `mouse:272` only when no bare binding it does not recognise is present,
+re-reads afterwards and rolls back what it just created if the result is not
+exactly its own single binding, and removes it only when every bare binding
+present is its own. Anything it cannot observe leaves the bindings untouched.
+With a pre-existing bare `mouse:272`, click-outside dismissal simply stays off
+and the icon still toggles the view.
 
 **What the desktop tells us is a hint, not an address.** Discovering the
 default browser ends in executing what it found, so the `.desktop` entry is

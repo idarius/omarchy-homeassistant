@@ -51,7 +51,6 @@ PROFILE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-homeassistant"
 # par le DESCRIPTEUR du repertoire d'etat, pas par son nom (voir plus bas).
 SD=""
 CLASS_FILE=""
-CLICK_MARK=""
 
 url=""
 width=480
@@ -304,8 +303,6 @@ init_state_dir() {
   chmod 700 "$SD" || die "cannot set mode 0700 on $STATE_DIR"
 
   CLASS_FILE="$SD/window-class"
-  # Preuve de propriete du bind souris global : voir arm_click.
-  CLICK_MARK="$SD/click-armed"
 
   # Vestiges des versions precedentes, tous effaces a travers le descripteur.
   # Les tests sont des builtins : le `rm` n'a lieu qu'une fois, a la premiere
@@ -320,6 +317,12 @@ init_state_dir() {
     rm -f "$SD/window-address" 2>/dev/null
   [[ -e $SD/window || -L $SD/window ]] &&
     rm -rf "$SD/window" 2>/dev/null
+  #  - 1.2.2 : `click-armed` pretendait prouver la propriete du bind souris.
+  #    Un fichier ne le peut pas — la preuve vient maintenant de la description
+  #    portee par la liaison elle-meme (voir arm_click). Le vestige est efface
+  #    pour qu'aucun marqueur pre-depose ne traine.
+  [[ -e $SD/click-armed || -L $SD/click-armed ]] &&
+    rm -f "$SD/click-armed" 2>/dev/null
   return 0
 }
 
@@ -431,6 +434,9 @@ sh_word() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 # `arm_click` est sur le chemin d'affichage.
 LUA_CLICK_BUTTON=$(lua_str "$CLICK_BUTTON")
 LUA_CLICK_CMD=$(lua_str "$(sh_word "$SELF") click")
+# PREUVE DE PROPRIETE DU BIND, PORTEE PAR L'OBJET LUI-MEME : voir arm_click.
+CLICK_DESC="io.github.idarius.homeassistant click-outside"
+LUA_CLICK_DESC=$(lua_str "$CLICK_DESC")
 
 # --- une invocation a la fois ------------------------------------------------
 #
@@ -794,68 +800,111 @@ read_state() {
 # compte a zero. Un utilisateur ayant son propre clic gauche nu le perdait donc
 # a la fermeture de la vue.
 #
-# Et on ne peut pas le remettre : `hyprctl binds -j` rend un bind Lua sous la
-# forme `dispatcher: "__lua", arg: "284"` — un IDENTIFIANT DE CALLBACK opaque.
-# La commande liee n'est pas recuperable, donc « sauvegarder puis restaurer »
-# est impossible, pas seulement delicat.
+# UN FICHIER NE PEUT PAS PROUVER LA PROPRIETE D'UN OBJET DU COMPOSITEUR.
+# La version precedente s'appuyait sur un marqueur d'etat, et une sequence
+# ordinaire suffisait a detruire la configuration de l'utilisateur :
 #
-# D'ou une preuve de propriete explicite :
+#   1. on pose le bind et on ecrit le marqueur ;
+#   2. `hyprctl reload` efface les binds Lua — et RECHARGE au passage la
+#      configuration de l'utilisateur, donc son propre `mouse:272` nu ;
+#   3. l'invocation suivante voit « un bind + mon marqueur », se croit
+#      proprietaire, et `hl.unbind` emporte le bind de l'utilisateur.
 #
-#  - on ne pose le bind que si AUCUN `mouse:272` sans modificateur n'existe
-#    deja — sauf s'il est a nous, le marqueur en fait foi ;
-#  - on ne le retire que si le marqueur est present ET qu'il n'y en a
-#    exactement qu'un : celui qu'on a pose.
+# Un marqueur pre-depose donnait le meme resultat.
 #
-# Le marqueur est un FICHIER D'ETAT, pas une variable : `disarm_click` est
-# appele par d'autres invocations que celle qui a arme.
+# LA PREUVE DOIT DONC VENIR DU COMPOSITEUR. Le dispatcher n'y suffit pas : sur
+# cette version, `hyprctl binds -j` rend TOUS les binds comme
+# `dispatcher: "__lua", arg: "<id opaque>"` (228 sur 228 ici), et la syntaxe
+# classique est refusee (« keyword can't work with non-legacy parsers »). Mais
+# `hl.bind` accepte une DESCRIPTION, et `hyprctl binds -j` la restitue :
+# c'est un champ de l'objet-liaison, pas un fichier a cote. Le marqueur d'etat
+# a donc disparu, et avec lui toute la classe de pannes ci-dessus.
 #
-# Consequence assumee : si l'utilisateur a deja un `mouse:272` nu, la fermeture
-# au clic ailleurs ne s'active pas. Le clic sur l'icone continue de basculer la
+# Regles, toutes en ECHEC FERME :
+#
+#  - lecture des binds impossible -> on ne pose rien, on ne retire rien ;
+#  - un bind nu dont la description n'est pas la notre -> on n'y touche jamais,
+#    et la fermeture au clic ailleurs reste desactivee ;
+#  - apres la pose, on RELIT : si le resultat n'est pas exactement « un bind a
+#    nous, aucun etranger », on defait ce qu'on vient de creer, et seulement si
+#    aucun etranger n'est present ;
+#  - un etranger apparu a cote du notre : on laisse tout en place. Le notre
+#    reste IDENTIFIABLE, donc recuperable des que l'etranger disparait — ce
+#    n'est pas une fuite definitive.
+#
+# Consequence assumee : avec un `mouse:272` nu preexistant, la fermeture au
+# clic ailleurs ne s'active pas. Le clic sur l'icone continue de basculer la
 # vue, et un diagnostic est emis.
-click_binds() {
-  local n
-  n=$(hypr_json binds 2>/dev/null |
-      jq --arg k "$CLICK_BUTTON" '[.[] | select(.key == $k and .modmask == 0)] | length') || return 1
-  valid_num "$n" || return 1
-  printf '%s' "$n"
+
+# « <a nous> <etrangers> », separes par une tabulation. Echec => 1, et
+# l'appelant ne touche a rien.
+click_bind_counts() {
+  local out
+  out=$(hypr_json binds 2>/dev/null |
+        jq -r --arg k "$CLICK_BUTTON" --arg d "$CLICK_DESC" '
+          [ .[] | select(.key == $k and .modmask == 0) ]
+          | [ (map(select(.description == $d)) | length),
+              (map(select(.description != $d)) | length) ]
+          | @tsv') || return 1
+  [[ $out =~ ^[0-9]{1,4}$'\t'[0-9]{1,4}$ ]] || return 1
+  printf '%s' "$out"
 }
-click_owned() { [[ -f $CLICK_MARK && ! -L $CLICK_MARK ]]; }
+
+click_unbind() { hy eval "hl.unbind($LUA_CLICK_BUTTON)" >/dev/null 2>&1 || true; }
 
 arm_click() {
   ((click_dismiss)) || return 0
-  local n; n=$(click_binds) || return 0
-  if ((n > 0)); then
-    click_owned || {
-      echo "mouse:272 is already bound by someone else, leaving it alone (click-outside dismissal stays off)" >&2
-      return 0
-    }
-    # `hl.bind` ne remplace pas : il EMPILE. Deux `show` d'affilee posaient
-    # deux binds, et un seul clic lancait alors deux `ha-window click`.
-    # Verifie avec `hyprctl binds -j` (le compte montait a 2, 3, ...).
-    disarm_click
-  fi
+  local counts mine foreign
+  counts=$(click_bind_counts) || {
+    echo "cannot read the compositor bindings, leaving mouse:272 alone" >&2
+    return 0
+  }
+  IFS=$'\t' read -r mine foreign <<<"$counts"
+  ((foreign == 0)) || {
+    echo "mouse:272 is bound by someone else, leaving it alone (click-outside dismissal stays off)" >&2
+    return 0
+  }
+  # `hl.bind` ne remplace pas : il EMPILE. Deux `show` d'affilee posaient deux
+  # binds, et un seul clic lancait alors deux `ha-window click`. Ici le retrait
+  # est prouve : il n'y a que les notres.
+  ((mine > 0)) && click_unbind
+
   # `$SELF` est verifie au demarrage (jeu de caracteres borne), puis mis entre
   # apostrophes pour /bin/sh et echappe pour Lua : le chemin d'installation ne
   # peut pas devenir de la syntaxe, dans aucune des deux couches.
   hy eval \
-    "hl.bind($LUA_CLICK_BUTTON, hl.dsp.exec_cmd($LUA_CLICK_CMD), { non_consuming = true })" \
-    >/dev/null 2>&1
-  write_state_file "$CLICK_MARK" "" || true
+    "hl.bind($LUA_CLICK_BUTTON, hl.dsp.exec_cmd($LUA_CLICK_CMD), { non_consuming = true, description = $LUA_CLICK_DESC })" \
+    >/dev/null 2>&1 || true
+
+  # POSE PARTIELLE : on relit, et on defait exactement ce qu'on vient de creer.
+  counts=$(click_bind_counts) || {
+    echo "cannot confirm the click-outside binding, leaving mouse:272 alone" >&2
+    return 0
+  }
+  IFS=$'\t' read -r mine foreign <<<"$counts"
+  if ((mine != 1 || foreign > 0)); then
+    ((foreign == 0 && mine > 0)) && click_unbind
+    echo "could not install the click-outside binding cleanly, rolled back" >&2
+    return 0
+  fi
   click_armed=1
+  return 0
 }
 
 disarm_click() {
   click_armed=0
-  # Pas de marqueur : le bind eventuellement present n'est pas le notre.
-  click_owned || return 0
-  local n; n=$(click_binds) || n=1
-  if ((n > 1)); then
-    echo "another mouse:272 binding appeared, leaving all of them alone" >&2
-    rm -f "$CLICK_MARK" 2>/dev/null
+  local counts mine foreign
+  counts=$(click_bind_counts) || {
+    echo "cannot read the compositor bindings, leaving mouse:272 alone" >&2
     return 0
-  fi
-  hy eval "hl.unbind($LUA_CLICK_BUTTON)" >/dev/null 2>&1
-  rm -f "$CLICK_MARK" 2>/dev/null
+  }
+  IFS=$'\t' read -r mine foreign <<<"$counts"
+  # Un etranger est present : `hl.unbind` les emporterait tous les deux.
+  ((foreign == 0)) || {
+    echo "another mouse:272 binding is installed, leaving all of them alone" >&2
+    return 0
+  }
+  ((mine > 0)) && click_unbind
   return 0
 }
 
