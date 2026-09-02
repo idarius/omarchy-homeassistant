@@ -914,12 +914,21 @@ ensure_no_anim() {
   write_state_file "$mark" "" || true
 }
 
-# Horloge en millisecondes SANS processus : `EPOCHREALTIME` est une variable
-# de bash. Le separateur decimal suit la LOCALE (virgule en francais), d'ou la
+# Horloge en millisecondes SANS PROCESSUS NI FORK. `EPOCHREALTIME` est une
+# variable de bash, mais une fonction qui l'ECHO doit etre appelee en
+# substitution de commande — donc un fork par appel, trois par image de
+# l'animation. Le resultat est pose dans NOW a la place.
+#
+# Mesure (glissement de 220 ms, ecran a 144 Hz) : le travail du script entre
+# deux images passe de 2,0 ms a 0,5 ms, et la cadence de ~80 a ~115 img/s. Sur
+# un `hyprctl dispatch` a 6,5 ms, ces forks etaient le seul poste compressible.
+#
+# Le separateur decimal suit la LOCALE (virgule en francais), d'ou la
 # substitution.
-now_ms() {
+NOW=0
+set_now() {
   local t=${EPOCHREALTIME/,/.}
-  echo $(( ${t%.*} * 1000 + 10#${t#*.} / 1000 ))
+  NOW=$(( ${t%.*} * 1000 + 10#${t#*.} / 1000 ))
 }
 
 # Le nombre d'images n'est PAS fixe d'avance : on se cale sur l'horloge et on
@@ -957,9 +966,9 @@ slide() {
   local tgt; tgt="{ window = $(lua_str "address:$addr")"
 
   local start el t e x spent rest st
-  start=$(now_ms)
+  set_now; start=$NOW
   while :; do
-    el=$(( $(now_ms) - start ))
+    set_now; el=$(( NOW - start ))
     ((el >= anim_ms)) && break
     # easeOutCubic sur 1000 : e = 1000 - (1000-t)^3 / 1000000
     t=$((el * 1000 / anim_ms))
@@ -967,7 +976,7 @@ slide() {
     x=$((from + (to - from) * e / 1000))
     hy dispatch "hl.dsp.window.move($tgt, x = $x, y = $y })" >/dev/null 2>&1
     # Dormir le RESTE de l'image, pas une duree fixe.
-    spent=$(( $(now_ms) - start - el ))
+    set_now; spent=$(( NOW - start - el ))
     rest=$(( FRAME_MS - spent ))
     if ((rest > 0)); then printf -v st "0.%03d" "$rest"; snooze "$st"; fi
   done

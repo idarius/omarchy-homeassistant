@@ -153,26 +153,44 @@ BarWidget {
   }
 
   // --- actions ------------------------------------------------------------
-  function args() {
-    var a = " --url " + quote(url) +
-            " --width " + winWidth +
-            " --height " + winHeight +
-            " --position " + quote(position) +
-            " --margin-x " + marginX +
-            " --margin-y " + marginY
-    if (!autoHide) a += " --no-click-dismiss"
-    a += " --anim-ms " + animMs
+  //
+  // ARGV DIRECT, PAS DE SHELL. `bar.run()` passe par
+  // `Quickshell.execDetached(["bash", "-lc", commande])` : un shell de LOGIN,
+  // qui source `/etc/profile`, les `profile.d` et `~/.bash_profile` avant
+  // d'executer quoi que ce soit. Mesure sur cette machine : **134 ms**, contre
+  // 1 ms pour `bash -c`.
+  //
+  // Ces 134 ms tombaient sur CHAQUE action declenchee par le widget, et sur
+  // elles seules : le masquage au clic ailleurs part d'un bind Hyprland, qui
+  // n'utilise pas de shell de login. D'ou l'asymetrie constatee — fermer en
+  // cliquant l'icone trainait, fermer en cliquant ailleurs non.
+  //
+  // On passe donc un ARGV, execute directement. C'est aussi une surface en
+  // moins : plus aucune valeur de reglage ne traverse une ligne de commande
+  // interpretee, donc plus rien a echapper (le `quote()` maison a disparu).
+  // `ha-window` valide de toute facon chaque argument de son cote.
+  //
+  // L'environnement devient celui de la session (celui de quickshell) au lieu
+  // de celui d'un shell de login. Verifie : son PATH contient /usr/bin,
+  // /usr/local/bin, ~/.local/bin et les exports flatpak, et les quatre
+  // dependances (chromium, jq, hyprctl, bash) sont dans /usr/bin.
+  function argv(action, extra) {
+    var a = [root.script, action,
+             "--url", String(url),
+             "--width", String(winWidth),
+             "--height", String(winHeight),
+             "--position", String(position),
+             "--margin-x", String(marginX),
+             "--margin-y", String(marginY),
+             "--anim-ms", String(animMs)]
+    if (!autoHide) a.push("--no-click-dismiss")
+    if (extra) a.push(String(extra))
     return a
-  }
-
-  function quote(value) {
-    return "'" + String(value).replace(/'/g, "'\\''") + "'"
   }
 
   function run(action, extra) {
     if (!root.bar) return
-    root.bar.run(quote(root.script) + " " + action + root.args()
-                 + (extra ? " " + extra : ""))
+    Quickshell.execDetached(root.argv(action, extra))
   }
 
   // La decision est deleguee au script, seul a connaitre l'etat complet : il
