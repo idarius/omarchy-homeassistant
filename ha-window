@@ -333,7 +333,13 @@ init_state_dir() {
 read_state_file() {
   local f="$1" fd v=""
   [[ -e $f ]] || return 0
-  exec {fd}<>"$f" 2>/dev/null || return 0
+  # ACCOLADES INDISPENSABLES. `exec {fd}<>"$f" 2>/dev/null` applique les DEUX
+  # redirections au SHELL COURANT, de facon permanente : la stderr du script
+  # partait a /dev/null des la premiere lecture d'etat, et tous les
+  # diagnostics ulterieurs disparaissaient en silence. Constate et mesure.
+  # Le groupe borne la portee de `2>/dev/null` ; le descripteur, lui, reste
+  # bien ouvert pour la suite.
+  { exec {fd}<>"$f"; } 2>/dev/null || return 0
   if [[ -f /dev/fd/$fd && -O /dev/fd/$fd ]]; then
     IFS= read -r -N 256 -u "$fd" v 2>/dev/null || true
   fi
