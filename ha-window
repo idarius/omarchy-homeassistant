@@ -65,6 +65,8 @@ click_dismiss=1
 # Le bind souris est GLOBAL : on suit son etat pour pouvoir le retirer meme
 # quand une invocation se termine en erreur (voir `cleanup`).
 click_armed=0
+# Etat de plein ecran de la fenetre, pose par read_state.
+fs=0
 anim_ms=220
 
 action="${1:-toggle}"
@@ -671,7 +673,11 @@ read -r -d '' JQ_STATE <<'JQ_EOF' || true
     # ne croise jamais son bandeau.
     (if ($xy[0] + ($w / 2)) >= ($m.x + ($sw / 2))
      then $m.x + $sw + 20
-     else $m.x - $w - 20 end) ]
+     else $m.x - $w - 20 end),
+    # Une fenetre en plein ecran IGNORE les dispatchers de taille et de
+    # position : sans ce champ, une vue passee en plein ecran par accident
+    # n'etait plus jamais rattrapable.
+    (if $c == null then 0 else ($c.fullscreen // 0) end) ]
 
 # Separateur = US (unite, \u001f), PAS une tabulation : `read` traite la
 # tabulation comme un espacement, fusionne les separateurs consecutifs et
@@ -697,14 +703,14 @@ read_state() {
   # Separateur US : voir la note dans JQ_STATE. Tout caractere d'espacement
   # (tabulation comprise) ferait perdre les champs vides a `read`.
   IFS=$'\x1f' read -r addr float cur_w cur_h cur_x cur_y tgt_x tgt_y \
-    pid in_special special_mon focused_ws mon_y off_x <<<"$line"
+    pid in_special special_mon focused_ws mon_y off_x fs <<<"$line"
 
   # RIEN DE CE QUI SUIT NE DEVIENT DE LA SYNTAXE LUA SANS AVOIR ETE VERIFIE.
   # Ces valeurs viennent de jq, donc du compositeur, mais elles ont transite
   # par des fichiers d'etat et une ligne de commande : on les revalide au
   # point d'entree plutot qu'a chaque usage.
   local n
-  for n in cur_w cur_h cur_x cur_y tgt_x tgt_y focused_ws mon_y off_x pid; do
+  for n in cur_w cur_h cur_x cur_y tgt_x tgt_y focused_ws mon_y off_x pid fs; do
     valid_num "${!n}" || die "unexpected compositor state for $n: '${!n}'"
   done
   for n in float in_special; do
@@ -1145,6 +1151,12 @@ slide() {
 geometry_cmds() {
   valid_addr "$addr" || { echo "refusing to move an invalid address: '$addr'" >&2; return 1; }
   local cmds="" tgt="{ window = $(lua_str "address:$addr")"
+  # EN PREMIER : un plein ecran rend `resize` et `move` sans effet. Constate a
+  # l'essai — la vue restait a la taille de l'ecran, et aucune invocation ne
+  # la recuperait. `internal` et `client` a 0 couvrent les deux origines
+  # possibles (le compositeur, ou une demande de la page).
+  [[ $fs != 0 ]] &&
+    cmds+="dispatch hl.dsp.window.fullscreen_state($tgt, internal = 0, client = 0 }) ; "
   [[ $float != true ]] && cmds+="dispatch hl.dsp.window.float($tgt }) ; "
   [[ $cur_w != "$width" || $cur_h != "$height" ]] &&
     cmds+="dispatch hl.dsp.window.resize($tgt, x = $width, y = $height }) ; "
