@@ -53,124 +53,163 @@ Panel {
   readonly property var positionOptions: Strings.positionOptions(root.lang)
   readonly property var languageOptions: Strings.languageOptions(root.lang)
 
-  PopupCard {
+  // KeyboardPanel, PAS PopupCard : un PopupCard est un `PopupWindow`, donc un
+  // xdg-popup — et un xdg-popup NE RECOIT PAS le focus clavier (c'est ecrit
+  // dans l'en-tete de `Ui/KeyboardPanel.qml` : « xdg-popups … only receive keys
+  // after a click/hover routes focus through their parent surface »). Aucun
+  // champ n'acceptait donc la moindre frappe : ni saisie, ni effacement, seules
+  // les fleches des champs numeriques repondaient, puisqu'elles passent par la
+  // SOURIS. `KeyboardPanel` est un layer-shell qui amorce en
+  // `WlrKeyboardFocus.Exclusive` puis retombe en `OnDemand` — c'est ce
+  // qu'utilisent tous les panneaux d'Omarchy qui saisissent du texte, y compris
+  // le plugin Frigate.
+  //
+  // Son API est un sous-ensemble de celle de PopupCard ; ni `triggerMode` ni
+  // `containsMouse` n'etaient utilises ici. Il gere lui-meme la fermeture au
+  // clic ailleurs (surface plein ecran + jumelles sur les autres ecrans), a la
+  // place du HyprlandFocusGrab.
+  KeyboardPanel {
     id: card
     anchorItem: root.anchorItem
     bar: root.bar
     owner: root.barIdentity
     open: root.opened
+    focusTarget: keyCatcher
     contentWidth: card.fittedContentWidth(Style.space(420))
     contentHeight: card.fittedContentHeight(column.implicitHeight)
 
-    ColumnLayout {
-      id: column
+    // `Keys.priority: Keys.BeforeItem` : sans `blocked`, ce capteur avalerait
+    // CHAQUE touche avant les champs — y compris les lettres et les chiffres.
+    // Chaque champ editable doit donc figurer dans la condition.
+    PanelKeyCatcher {
+      id: keyCatcher
       anchors.fill: parent
-      spacing: Style.space(8)
+      blocked: urlField.activeFocus
+        || widthField.field.activeFocus || heightField.field.activeFocus
+        || marginXField.field.activeFocus || marginYField.field.activeFocus
+        || animField.field.activeFocus
+        || positionDropdown.popupOpen || languageDropdown.popupOpen
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      PanelSectionHeader { text: root.tr("sectionDashboard") }
-
-      TextField {
-        Layout.fillWidth: true
-        text: root.get("url", "")
-        placeholderText: root.tr("urlPlaceholder")
-        onEditingFinished: root.save("url", text)
-      }
-
-      PanelSectionHeader { text: root.tr("sectionWindow") }
-
-      RowLayout {
-        Layout.fillWidth: true
+      ColumnLayout {
+        id: column
+        anchors.fill: parent
         spacing: Style.space(8)
 
-        NumberField {
-          label: root.tr("width")
-          from: 200; to: 4000; stepSize: 20
-          value: root.get("width", 480)
-          onModified: function(v) { root.save("width", v) }
-        }
+        PanelSectionHeader { text: root.tr("sectionDashboard") }
 
-        NumberField {
-          label: root.tr("height")
-          from: 200; to: 4000; stepSize: 20
-          value: root.get("height", 900)
-          onModified: function(v) { root.save("height", v) }
-        }
-      }
-
-      Dropdown {
-        Layout.fillWidth: true
-        label: root.tr("position")
-        options: root.positionOptions
-        value: root.get("position", "top-right")
-        onChanged: function(v) { root.save("position", v) }
-      }
-
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(8)
-
-        NumberField {
-          label: root.tr("marginSide")
-          from: 0; to: 400; stepSize: 4
-          value: root.get("marginX", root.get("margin", 12))
-          onModified: function(v) { root.save("marginX", v) }
-        }
-
-        NumberField {
-          label: root.tr("marginVertical")
-          from: 0; to: 400; stepSize: 4
-          value: root.get("marginY", root.get("margin", 12))
-          onModified: function(v) { root.save("marginY", v) }
-        }
-      }
-
-      NumberField {
-        label: root.tr("openDuration")
-        from: 0; to: 1200; stepSize: 20
-        value: root.get("animMs", 220)
-        onModified: function(v) { root.save("animMs", v) }
-      }
-
-      PanelSectionHeader { text: root.tr("sectionBehaviour") }
-
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(8)
-        Text {
+        TextField {
+          id: urlField
           Layout.fillWidth: true
-          text: root.tr("hideOnOutsideClick")
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
+          text: root.get("url", "")
+          placeholderText: root.tr("urlPlaceholder")
+          onEditingFinished: root.save("url", text)
         }
-        ToggleSwitch {
-          checked: root.get("autoHide", true)
-          onToggled: root.save("autoHide", !checked)
-        }
-      }
 
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(8)
-        Text {
+        PanelSectionHeader { text: root.tr("sectionWindow") }
+
+        RowLayout {
           Layout.fillWidth: true
-          text: root.tr("preloadAtStartup")
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-        }
-        ToggleSwitch {
-          checked: root.get("prewarm", true)
-          onToggled: root.save("prewarm", !checked)
-        }
-      }
+          spacing: Style.space(8)
 
-      Dropdown {
-        Layout.fillWidth: true
-        label: root.tr("language")
-        options: root.languageOptions
-        value: root.get("language", "auto")
-        onChanged: function(v) { root.save("language", v) }
+          NumberField {
+            id: widthField
+            label: root.tr("width")
+            from: 200; to: 4000; stepSize: 10
+            value: root.get("width", 480)
+            onModified: function(v) { root.save("width", v) }
+          }
+
+          NumberField {
+            id: heightField
+            label: root.tr("height")
+            from: 200; to: 4000; stepSize: 10
+            value: root.get("height", 900)
+            onModified: function(v) { root.save("height", v) }
+          }
+        }
+
+        Dropdown {
+          id: positionDropdown
+          Layout.fillWidth: true
+          label: root.tr("position")
+          options: root.positionOptions
+          value: root.get("position", "top-right")
+          onChanged: function(v) { root.save("position", v) }
+        }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+
+          NumberField {
+            id: marginXField
+            label: root.tr("marginSide")
+            from: 0; to: 400; stepSize: 1
+            value: root.get("marginX", root.get("margin", 12))
+            onModified: function(v) { root.save("marginX", v) }
+          }
+
+          NumberField {
+            id: marginYField
+            label: root.tr("marginVertical")
+            from: 0; to: 400; stepSize: 1
+            value: root.get("marginY", root.get("margin", 12))
+            onModified: function(v) { root.save("marginY", v) }
+          }
+        }
+
+        NumberField {
+          id: animField
+          label: root.tr("openDuration")
+          from: 0; to: 1200; stepSize: 10
+          value: root.get("animMs", 220)
+          onModified: function(v) { root.save("animMs", v) }
+        }
+
+        PanelSectionHeader { text: root.tr("sectionBehaviour") }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+          Text {
+            Layout.fillWidth: true
+            text: root.tr("hideOnOutsideClick")
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+          ToggleSwitch {
+            checked: root.get("autoHide", true)
+            onToggled: root.save("autoHide", !checked)
+          }
+        }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(8)
+          Text {
+            Layout.fillWidth: true
+            text: root.tr("preloadAtStartup")
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+          ToggleSwitch {
+            checked: root.get("prewarm", true)
+            onToggled: root.save("prewarm", !checked)
+          }
+        }
+
+        Dropdown {
+          id: languageDropdown
+          Layout.fillWidth: true
+          label: root.tr("language")
+          options: root.languageOptions
+          value: root.get("language", "auto")
+          onChanged: function(v) { root.save("language", v) }
+        }
       }
     }
   }

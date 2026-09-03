@@ -184,7 +184,12 @@ BarWidget {
              "--margin-y", String(marginY),
              "--anim-ms", String(animMs)]
     if (!autoHide) a.push("--no-click-dismiss")
-    if (extra) a.push(String(extra))
+    // `extra` accepte un drapeau ou un tableau de drapeaux : `openConfig` en
+    // passe deux.
+    if (extra) {
+      if (Array.isArray(extra)) for (var i = 0; i < extra.length; i++) a.push(String(extra[i]))
+      else a.push(String(extra))
+    }
     return a
   }
 
@@ -234,7 +239,11 @@ BarWidget {
     // FIN de son animation, potentiellement apres le `disarm-click` declenche
     // par l'ouverture du panneau — et un clic dans les reglages refermerait la
     // vue. Le bind sera pose a la fermeture du panneau, par onOpenedChanged.
-    if (root.configured && !root.shown) root.run("show", "--no-click-dismiss")
+    // `--no-focus` en plus : sans lui, le `hl.dsp.focus` final de `show` arrive
+    // APRES l'ouverture du panneau et emporte le focus CLAVIER sur le
+    // navigateur. Le focus grab du panneau garde la souris, donc les fleches
+    // des champs numeriques repondaient encore — mais plus aucune frappe.
+    if (root.configured && !root.shown) root.run("show", ["--no-click-dismiss", "--no-focus"])
     panel.open()
   }
 
@@ -263,6 +272,30 @@ BarWidget {
     running: root.prewarm && root.configured
     repeat: false
     onTriggered: if (!root.windowExists) root.run("prewarm")
+  }
+
+  // --- regle `no_anim`, reposee apres un rechargement de config -----------
+  //
+  // `ha-window` pose sur la fenetre une regle `no_anim = true` via
+  // `hyprctl eval`. Sans elle, Hyprland anime CHAQUE image du glissement (~100
+  // par seconde) et la position RENDUE prend un decalage lateral durable —
+  // mesure a +355 px, identique sur les deux ecrans, que ni un `move`, ni un
+  // `resize`, ni un `float` ne resorbent : seule une fenetre neuve repart
+  // juste. La vue apparait alors tronquee, d'une largeur qui change a chaque
+  // affichage.
+  //
+  // Or `hyprctl reload` efface les regles de fenetre SANS changer la signature
+  // d'instance : le marqueur `noanim.<signature>` survivait au rechargement et
+  // `ensure_no_anim` ne reposait plus rien. Le bug s'installait alors jusqu'au
+  // prochain `omarchy restart shell`.
+  //
+  // Hyprland emet `configreloaded>>` sur son socket d'evenements — verifie au
+  // `socat`. Le widget l'ecoute et fait reposer la regle.
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      if (event.name === "configreloaded" && root.configured) root.run("ensure-noanim")
+    }
   }
 
   // --- geometrie ----------------------------------------------------------

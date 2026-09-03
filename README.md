@@ -189,7 +189,13 @@ is usable on its own:
 ```
 
 `ha-window --help` is the comment block at the top of the file. Actions:
-`toggle`, `show`, `hide`, `prewarm`, `reposition`, `status`, `quit`.
+`toggle`, `show`, `hide`, `prewarm`, `reposition`, `status`, `quit`,
+`ensure-noanim`.
+
+`show` accepts `--no-focus`, which displays the window without giving it the
+keyboard focus. The settings panel uses it: it opens the view before opening
+itself, and the focus would otherwise land on the browser a moment later and
+take the keyboard away from the panel.
 
 Handy for a Hyprland keybinding in `~/.config/hypr/bindings.lua`:
 
@@ -200,21 +206,34 @@ o.bind("SUPER + H", "Home Assistant",
 
 ## Known issues and caveats
 
-**The window may end up drawn in the wrong place after a `hyprctl reload`.**
-The plugin tells Hyprland not to animate its window
-(`hl.window_rule({ ..., no_anim = true })`), because the compositor would
-otherwise animate each frame of the slide on top of it. Window rules are lost on
-a config reload, and the special workspace's `slidevert` animation then leaves a
-**permanent vertical offset** on the window: Hyprland reports the right position
-while drawing it somewhere else. `omarchy restart shell` re-arms the rule. If
-you reload your Hyprland config often, disable that animation for good in
-`~/.config/hypr/looknfeel.lua`:
+**A window rule is re-armed after every `hyprctl reload`.** The plugin tells
+Hyprland not to animate its window (`hl.window_rule({ ..., no_anim = true })`),
+because the compositor would otherwise animate each frame of the slide on top of
+it — and the offset it leaves behind is **permanent**: Hyprland reports the right
+geometry while drawing the window somewhere else, and no later move, resize or
+float clears it. Only a fresh window starts clean.
+
+Window rules are lost on a config reload, so the bar widget listens for
+Hyprland's `configreloaded` event and re-arms the rule at once. You should never
+have to do anything. If you reload your Hyprland config often, you can also
+disable the special workspace animation for good, which removes the other half
+of the problem — the vertical offset its `slidevert` leaves behind — during the
+brief window between the reload and the event:
 
 ```lua
+-- ~/.config/hypr/looknfeel.lua
 hl.animation({ leaf = "specialWorkspace", enabled = false })
 ```
 
 Nothing else uses that animation unless you drive special workspaces yourself.
+
+**On a multi-monitor desktop, the slide is skipped when the nearest edge is
+not really off screen.** The window starts outside the screen and slides in, but
+on a side-by-side desktop the right edge of the left monitor *is* the left edge
+of the right one — the view used to travel across the neighbouring screen for the
+whole animation. The starting rectangle is now tested against every monitor, and
+if the nearest edge is covered the window simply appears in place. A blunt
+appearance beats a trip across another screen.
 
 **The window slides in from the nearest side edge, not from under the bar.**
 Coming down from under the bar would mean animating the window's height, and

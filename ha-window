@@ -36,6 +36,7 @@
 #     --browser BIN      force a specific browser binary
 #     --anim-ms N        slide duration in ms (default 220, 0 = instant)
 #     --no-click-dismiss do not hide the view when clicking elsewhere
+#     --no-focus         show the view without giving it the keyboard focus
 #
 # Test hook: HA_CLICK_AT="X Y" overrides the pointer position for `click`.
 
@@ -61,6 +62,13 @@ margin_x=""
 margin_y=""
 browser=""
 click_dismiss=1
+# `show` finit normalement par focaliser la vue. Le panneau de reglages ouvre la
+# vue AVANT de s'ouvrir lui-meme : ce focus tardif partait alors au navigateur et
+# emportait le CLAVIER, alors que le focus grab du panneau gardait la souris. Les
+# fleches des champs numeriques repondaient, la frappe non — « je ne peux pas
+# saisir de texte, juste augmenter ou baisser ». Meme piege que pour
+# `reposition`, reste ouvert sur ce chemin.
+focus_on_show=1
 # Le bind souris est GLOBAL : on suit son etat pour pouvoir le retirer meme
 # quand une invocation se termine en erreur (voir `cleanup`).
 click_armed=0
@@ -82,6 +90,7 @@ while (($#)); do
   --margin-y) margin_y="${2:-}"; shift 2 ;;
   --browser) browser="${2:-}"; shift 2 ;;
   --no-click-dismiss) click_dismiss=0; shift ;;
+  --no-focus) focus_on_show=0; shift ;;
   --anim-ms) anim_ms="${2:-}"; shift 2 ;;
   *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
@@ -113,7 +122,7 @@ check_int() { # nom valeur min max
 }
 
 case "$action" in
-toggle | show | hide | prewarm | reposition | status | quit | click | arm-click | disarm-click) ;;
+toggle | show | hide | prewarm | reposition | status | quit | click | arm-click | disarm-click | ensure-noanim) ;;
 *) die "unknown action: $action" ;;
 esac
 
@@ -661,6 +670,29 @@ read -r -d '' JQ_STATE <<'JQ_EOF' || true
 | ("special:" + $special) as $spname
 | ($monitors | map(select(.specialWorkspace.name == $spname)) | first) as $spmon
 
+# --- Bord d'entree de l'animation --------------------------------------------
+#
+# La fenetre part HORS ECRAN, puis entre par glissement lateral. « Hors ecran »
+# ne se juge PAS sur le seul moniteur courant : sur un bureau multi-ecrans, le
+# bord droit de l'ecran de gauche EST le bord gauche de l'ecran de droite. La
+# fenetre traversait donc tout l'ecran voisin pendant son animation.
+#
+# Le bord retenu reste le PLUS PROCHE, pour que le trajet soit court. S'il est
+# bouche par un moniteur voisin, $offx vaut la position finale et `show` saute
+# l'animation : mieux vaut une apparition seche que la vue traversant un ecran
+# entier — le sien comme celui d'a cote.
+| ($monitors | map({ x: .x, y: .y,
+     w: ((.width  / ((.scale // 1) | if . == 0 then 1 else . end)) | floor),
+     h: ((.height / ((.scale // 1) | if . == 0 then 1 else . end)) | floor) })) as $rects
+| def offscreen($px):
+    ($rects | map(select($px < (.x + .w) and ($px + $w) > .x
+                         and $xy[1] < (.y + .h) and ($xy[1] + $h) > .y))
+            | length) == 0;
+  (if ($xy[0] + ($w / 2)) >= ($m.x + ($sw / 2))
+   then $m.x + $sw + 20
+   else $m.x - $w - 20 end) as $near
+| (if offscreen($near) then $near else $xy[0] end) as $offx
+
 | [ (if $c == null then "" else $c.address end),
     (if $c == null then false else $c.floating end),
     (if $c == null then 0 else $c.size[0] end),
@@ -674,12 +706,9 @@ read -r -d '' JQ_STATE <<'JQ_EOF' || true
     (if $spmon == null then "" else $spmon.name end),
     $fm.activeWorkspace.id,
     $m.y,
-    # Bord hors ecran d'ou la fenetre entre : le PLUS PROCHE, pour que le
-    # trajet reste court. La barre est horizontale, donc entrer par un cote
-    # ne croise jamais son bandeau.
-    (if ($xy[0] + ($w / 2)) >= ($m.x + ($sw / 2))
-     then $m.x + $sw + 20
-     else $m.x - $w - 20 end),
+    # Bord hors ecran d'ou la fenetre entre. Voir $offx : « hors ecran » se
+    # juge sur TOUS les moniteurs, pas sur le seul moniteur courant.
+    $offx,
     # Une fenetre en plein ecran IGNORE les dispatchers de taille et de
     # position : sans ce champ, une vue passee en plein ecran par accident
     # n'etait plus jamais rattrapable.
@@ -1154,6 +1183,9 @@ set_now() {
 # icones. Entrer par le bord lateral le plus proche ne croise jamais la barre,
 # et laisse son fond transparent intact.
 FRAME_MS=7
+# Fenetre pendant laquelle deux invocations de `ensure-noanim` sont considerees
+# comme repondant au MEME rechargement de config (une par ecran).
+COALESCE_S=2
 # slide FROM_X TO_X Y — glissement HORIZONTAL, easeOutCubic.
 slide() {
   local from="$1" to="$2" y="$3"
@@ -1310,8 +1342,13 @@ show() {
 
   # La fenetre est posee HORS ECRAN, au-dela du bord lateral le plus proche,
   # puis entre. Elle n'apparait donc jamais d'un coup a sa place finale.
+  # `$off_x` vaut `$tgt_x` quand aucun bord lateral n'est reellement hors ecran
+  # (ecran encadre par deux autres) : l'animation est alors sautee, plutot que
+  # de faire traverser l'ecran voisin. Voir « Bord d'entree » dans JQ_STATE.
   local start_x="$tgt_x"
-  ((anim_ms > 0)) && { ensure_no_anim; start_x="$off_x"; }
+  # `|| true` : sous `set -e`, une liste `&&` dont la condition est fausse rend
+  # un code non nul et tuerait le script (cas `--anim-ms 0`).
+  ((anim_ms > 0)) && [[ $off_x != "$tgt_x" ]] && { ensure_no_anim; start_x="$off_x"; } || true
 
   valid_addr "$addr" || { echo "show cancelled: invalid window address" >&2; return 1; }
   local tgt="{ window = $(lua_str "address:$addr")"
@@ -1320,7 +1357,10 @@ show() {
   [[ $cur_w != "$width" || $cur_h != "$height" ]] &&
     cmds+=" ; dispatch hl.dsp.window.resize($tgt, x = $width, y = $height })"
   cmds+=" ; dispatch hl.dsp.window.move($tgt, x = $start_x, y = $tgt_y })"
-  cmds+=" ; dispatch hl.dsp.focus($tgt })"
+  # Le focus reste le DERNIER dispatcher du lot : le poser avant sortirait la
+  # fenetre de la reserve en OUVRANT celle-ci. Il est simplement omis quand
+  # l'appelant ne veut pas du clavier (panneau de reglages).
+  ((focus_on_show)) && cmds+=" ; dispatch hl.dsp.focus($tgt })" || true
   hy --batch "$cmds" >/dev/null 2>&1
 
   slide "$start_x" "$tgt_x" "$tgt_y"
@@ -1415,6 +1455,47 @@ prewarm)
   ;;
 show) show ;;
 hide) hide ;;
+# Repose la regle `no_anim` apres un `hyprctl reload`, qui efface les regles de
+# fenetre SANS changer la signature d'instance — le marqueur `noanim.<sig>`
+# survivait donc au rechargement et `ensure_no_anim` ne reposait plus rien.
+#
+# Sans cette regle, Hyprland anime chaque image du glissement : la position
+# RENDUE prend un decalage lateral durable (mesure : +355 px, constant, sur les
+# deux ecrans) que ni un `move`, ni un `resize`, ni un `float` ne resorbent —
+# seule une fenetre neuve repart juste. La vue apparait alors tronquee, d'une
+# largeur qui change a chaque affichage.
+#
+# Le widget de barre appelle cette action sur l'evenement `configreloaded` du
+# socket d'evenements Hyprland. Elle ne lance rien : si aucune fenetre n'existe
+# encore, la regle vaut pour la prochaine.
+ensure-noanim)
+  # UN BAR-WIDGET EST INSTANCIE UNE FOIS PAR ECRAN. Sur un bureau a plusieurs
+  # moniteurs, toutes les instances reagissent au meme `configreloaded` et
+  # poseraient chacune une regle. `hl.window_rule` EMPILE et rien ne permet de
+  # retirer une regle de fenetre : l'empilement serait borne (une par ecran, et
+  # remis a zero au rechargement suivant, qui les efface toutes) mais il est
+  # inutile. Les invocations etant serialisees par le verrou, la seconde voit un
+  # marqueur qui vient d'etre ecrit et s'arrete.
+  #
+  # Le pire cas est deux rechargements en moins de COALESCE_S secondes : la
+  # regle reste alors absente jusqu'au suivant, soit exactement l'etat d'avant
+  # ce correctif. Jamais destructeur.
+  sig="${HYPRLAND_INSTANCE_SIGNATURE:-unknown}"
+  [[ $sig =~ ^[A-Za-z0-9_-]{1,128}$ ]] || sig="unknown"
+  mark="$SD/noanim.$sig"
+  # PAS `valid_num` : elle borne a sept chiffres, un horodatage Unix en a dix.
+  mtime=0
+  if [[ -f $mark && ! -L $mark ]]; then
+    mtime=$(stat -c %Y "$mark" 2>/dev/null) || mtime=0
+    [[ $mtime =~ ^[0-9]{1,11}$ ]] || mtime=0
+  fi
+  if ((mtime > 0)) && ((EPOCHSECONDS - mtime <= COALESCE_S)); then
+    echo "no_anim rule already re-armed for this reload" >&2
+  else
+    rm -f "$SD"/noanim.* 2>/dev/null || true
+    ensure_no_anim
+  fi
+  ;;
 click) click_outside ;;
 # Pose/retire le bind a la demande du widget : pendant que le panneau de
 # reglages est ouvert, un clic dedans ne doit PAS refermer la vue.
