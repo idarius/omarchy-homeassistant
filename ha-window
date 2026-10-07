@@ -424,6 +424,7 @@ valid_addr() { [[ $1 =~ ^0x[0-9a-fA-F]{1,16}$ ]]; }
 # « chrome-ha.example.net__dashboard_accueil-Default ».
 valid_class() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
 valid_mon() { [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
+valid_special() { [[ -z $1 || $1 =~ ^special:[A-Za-z0-9._-]{1,64}$ ]]; }
 
 # Deuxieme rempart : ce qui entre malgre tout dans une chaine Lua y est
 # echappe. Le premier rempart reste l'allowlist ci-dessus — cette fonction ne
@@ -712,7 +713,18 @@ read -r -d '' JQ_STATE <<'JQ_EOF' || true
     # Une fenetre en plein ecran IGNORE les dispatchers de taille et de
     # position : sans ce champ, une vue passee en plein ecran par accident
     # n'etait plus jamais rattrapable.
-    (if $c == null then 0 else ($c.fullscreen // 0) end) ]
+    (if $c == null then 0 else ($c.fullscreen // 0) end),
+    # Special workspace ETRANGER (scratchpad...) ouvert sur l'ecran cible.
+    # Hyprland n'en montre qu'UN par ecran : poser la vue sur le workspace
+    # normal puis la focaliser REFERMAIT ce special. `show` pose donc la vue
+    # DEDANS. Vide si aucun, ou si c'est notre reserve.
+    (($m.specialWorkspace.name // "") | if . == $spname then "" else . end),
+    # Workspace actuel de la fenetre, et si c'est un special ouvert quelque
+    # part : une vue laissee dans un scratchpad referme n'est PAS visible.
+    (if $c == null then "" else $c.workspace.name end),
+    (if $c == null then false
+     else ($c.workspace.name as $wn
+           | $monitors | any(.specialWorkspace.name == $wn)) end) ]
 
 # Separateur = US (unite, \u001f), PAS une tabulation : `read` traite la
 # tabulation comme un espacement, fusionne les separateurs consecutifs et
@@ -724,7 +736,7 @@ JQ_EOF
 
 addr=""; float=""; cur_w=""; cur_h=""; cur_x=""; cur_y=""
 tgt_x=""; tgt_y=""; pid=""; in_special=""; special_mon=""; focused_ws=""; vis=""
-mon_y=""; off_x=""
+mon_y=""; off_x=""; host_ws=""; win_ws=""; win_open=""; foreign=""
 
 read_state() {
   local ref="${1:-window}" line
@@ -738,7 +750,7 @@ read_state() {
   # Separateur US : voir la note dans JQ_STATE. Tout caractere d'espacement
   # (tabulation comprise) ferait perdre les champs vides a `read`.
   IFS=$'\x1f' read -r addr float cur_w cur_h cur_x cur_y tgt_x tgt_y \
-    pid in_special special_mon focused_ws mon_y off_x fs <<<"$line"
+    pid in_special special_mon focused_ws mon_y off_x fs host_ws win_ws win_open <<<"$line"
 
   # RIEN DE CE QUI SUIT NE DEVIENT DE LA SYNTAXE LUA SANS AVOIR ETE VERIFIE.
   # Ces valeurs viennent de jq, donc du compositeur, mais elles ont transite
@@ -748,13 +760,19 @@ read_state() {
   for n in cur_w cur_h cur_x cur_y tgt_x tgt_y focused_ws mon_y off_x pid fs; do
     valid_num "${!n}" || die "unexpected compositor state for $n: '${!n}'"
   done
-  for n in float in_special; do
+  for n in float in_special win_open; do
     [[ ${!n} == true || ${!n} == false ]] ||
       die "unexpected compositor state for $n: '${!n}'"
   done
   [[ -z $special_mon ]] || valid_mon "$special_mon" ||
     die "unexpected monitor name: '$special_mon'"
   [[ -z $addr ]] || valid_addr "$addr" || addr=""
+  # Seul `host_ws` devient de la syntaxe Lua (via lua_str) ; `win_ws` n'est
+  # que compare. Un nom inattendu desactive simplement le cas special.
+  valid_special "$host_ws" || host_ws=""
+  # Dans un special ETRANGER (pas notre reserve) : voir `stash_foreign`.
+  foreign=false
+  [[ $in_special == false && $win_ws == special:* ]] && foreign=true
 
   # PREUVE DE PROPRIETE. La classe ne suffit pas a prouver que la fenetre est
   # la notre : Chromium la fabrique a partir de l'URL, donc une fenetre que
@@ -777,6 +795,7 @@ read_state() {
   # actuellement ouverte sur un ecran.
   if   [[ -z $addr ]];                                 then vis="absente"
   elif [[ $in_special == true && -z $special_mon ]];    then vis="cachee"
+  elif [[ $foreign == true && $win_open == false ]];    then vis="cachee"
   else                                                      vis="visible"
   fi
 
@@ -940,7 +959,7 @@ disarm_click() {
 click_outside() {
   read_state window
   # Vue fermee (ou fenetre disparue) : le bind n'a plus lieu d'etre.
-  [[ $vis == visible ]] || { disarm_click; return 0; }
+  [[ $vis == visible ]] || { disarm_click; stash_foreign; return 0; }
 
   local cx cy
   # HA_CLICK_AT="X Y" court-circuite la position du pointeur. Uniquement pour
@@ -1352,7 +1371,11 @@ show() {
 
   valid_addr "$addr" || { echo "show cancelled: invalid window address" >&2; return 1; }
   local tgt="{ window = $(lua_str "address:$addr")"
-  local cmds="dispatch hl.dsp.window.move($tgt, workspace = $(lua_str "$focused_ws") })"
+  # Scratchpad (ou autre special) ouvert sur l'ecran : la vue s'y pose, sinon
+  # le focus final la mettrait sur le workspace normal et refermerait le special.
+  local dest="$focused_ws"
+  [[ -n $host_ws ]] && dest="$host_ws"
+  local cmds="dispatch hl.dsp.window.move($tgt, workspace = $(lua_str "$dest") })"
   [[ $float != true ]] && cmds+=" ; dispatch hl.dsp.window.float($tgt })"
   [[ $cur_w != "$width" || $cur_h != "$height" ]] &&
     cmds+=" ; dispatch hl.dsp.window.resize($tgt, x = $width, y = $height })"
@@ -1368,9 +1391,55 @@ show() {
   arm_click
 }
 
+# Range dans la reserve une vue posee dans un special ETRANGER (scratchpad).
+#
+# Verifie le 2026-10-07 : quand ce special est ouvert, y prendre la fenetre
+# pour l'envoyer dans notre reserve OUVRE notre reserve a sa place, focus ou
+# pas. Le lot referme donc notre reserve puis rouvre le special d'origine ;
+# groupe, il est traite avant le rendu, comme le lot de `hide`.
+# Les deux `toggle_special` sont des bascules : l'etat est relu ensuite et
+# corrige au besoin, sans jamais refaire une bascule a l'aveugle.
+stash_foreign() {
+  [[ $foreign == true ]] && valid_addr "$addr" && valid_special "$win_ws" || return 0
+  local tgt="{ window = $(lua_str "address:$addr")" host="${win_ws#special:}" mon cur
+  mon=$(hypr_json monitors | jq -r --arg n "$win_ws" \
+    'map(select(.specialWorkspace.name == $n)) | first | .name // ""')
+  [[ -z $mon ]] || valid_mon "$mon" || mon=""
+
+  if [[ -z $mon ]]; then
+    # Special deja referme par l'utilisateur : simple rangement.
+    hy dispatch "hl.dsp.window.move($tgt, workspace = $(lua_str "special:$SPECIAL") })" >/dev/null 2>&1
+    close_special || true
+    return 0
+  fi
+
+  hy --batch "dispatch hl.dsp.focus({ monitor = $(lua_str "$mon") }) ; dispatch hl.dsp.window.move($tgt, workspace = $(lua_str "special:$SPECIAL") }) ; dispatch hl.dsp.workspace.toggle_special($(lua_str "$SPECIAL")) ; dispatch hl.dsp.workspace.toggle_special($(lua_str "$host"))" \
+    >/dev/null 2>&1
+
+  # Filet : notre reserve fermee, le special d'origine rouvert.
+  close_special || true
+  cur=$(hypr_json monitors | jq -r --arg m "$mon" \
+    'map(select(.name == $m)) | first | .specialWorkspace.name // ""')
+  if [[ $cur != "$win_ws" ]]; then
+    hy --batch "dispatch hl.dsp.focus({ monitor = $(lua_str "$mon") }) ; dispatch hl.dsp.workspace.toggle_special($(lua_str "$host"))" >/dev/null 2>&1
+  fi
+}
+
 hide() {
   read_state window
   [[ $vis != absente ]] || return 0
+
+  # Vue laissee dans un scratchpad que l'utilisateur a referme : la ranger,
+  # sinon elle reapparaitrait a la prochaine ouverture du scratchpad.
+  [[ $vis == cachee ]] && { stash_foreign; return 0; }
+
+  if [[ $foreign == true ]]; then
+    disarm_click
+    ensure_no_anim
+    slide "$cur_x" "$off_x" "$cur_y"
+    stash_foreign
+    return 0
+  fi
 
   # Idempotent, et surtout SANS focus quand la fenetre est deja rangee et la
   # reserve fermee : focaliser une fenetre posee dans une reserve cachee la
